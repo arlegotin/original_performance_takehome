@@ -139,15 +139,77 @@ class KernelBuilder:
         two_v = self.alloc_scratch("two_v", VLEN)
         n_nodes_v = self.alloc_scratch("n_nodes_v", VLEN)
         forest_base_v = self.alloc_scratch("forest_base_v", VLEN)
+        # Early block offset setup to overlap const loads with init bundles.
+        vec_batch_temp = (batch_size // VLEN) * VLEN
+        offset_values = list(range(0, vec_batch_temp, VLEN))  # 0, 8, 16, ..., 248
+
+        # Allocate all block offset addresses upfront
+        offset_addrs = []
+        for i, off in enumerate(offset_values):
+            if off == 0:
+                addr = zero_const
+            else:
+                addr = self.alloc_scratch(f"block_off_{i}")
+                self.const_map[off] = addr
+            offset_addrs.append(addr)
+
+        # Load only base offsets (every 4th); compute the rest with ALU adds.
+        offset_base_indices = list(range(0, len(offset_values), 4))
+        base_load_indices = [
+            i for i in offset_base_indices if offset_addrs[i] != zero_const
+        ]
+        eight_const = self.alloc_scratch("eight_const")
+        sixteen_const = self.alloc_scratch("sixteen_const")
+        twentyfour_const = self.alloc_scratch("twentyfour_const")
+        self.const_map[8] = eight_const
+        self.const_map[16] = sixteen_const
+        self.const_map[24] = twentyfour_const
+        offset_loads = [
+            (eight_const, 8),
+            (sixteen_const, 16),
+            (twentyfour_const, 24),
+        ]
+        offset_loads.extend((offset_addrs[i], offset_values[i]) for i in base_load_indices)
+
+        base_addr_set = set()
+        base_targets = {}
+        for base_idx in offset_base_indices:
+            base_addr = offset_addrs[base_idx]
+            base_addr_set.add(base_addr)
+            base_targets[base_addr] = (
+                offset_addrs[base_idx + 1],
+                offset_addrs[base_idx + 2],
+                offset_addrs[base_idx + 3],
+            )
+        const_addr_set = {eight_const, sixteen_const, twentyfour_const}
+
+        early_load_count = min(6, len(offset_loads))
+        early_offset_loads = offset_loads[:early_load_count]
+        offset_loads = offset_loads[early_load_count:]
+        early_loaded_base_addrs = {addr for addr, _ in early_offset_loads if addr in base_addr_set}
+        early_loaded_const_addrs = {addr for addr, _ in early_offset_loads if addr in const_addr_set}
+        early_load_queue = list(early_offset_loads)
+
+        def take_early_loads():
+            loads = []
+            while len(loads) < 2 and early_load_queue:
+                addr, val = early_load_queue.pop(0)
+                loads.append(("const", addr, val))
+            return loads
+
         # OPTIMIZED: Pack 6 vbroadcasts into 1 cycle (root_vec added since root_scalar already loaded)
-        self.add_bundle({"valu": [
+        vb_bundle = {"valu": [
             ("vbroadcast", zero_v, zero_const),
             ("vbroadcast", one_v, one_const),
             ("vbroadcast", two_v, two_const),
             ("vbroadcast", n_nodes_v, self.scratch["n_nodes"]),
             ("vbroadcast", forest_base_v, self.scratch["forest_values_p"]),
             ("vbroadcast", root_vec, root_scalar),
-        ]})
+        ]}
+        early_load_ops = take_early_loads()
+        if early_load_ops:
+            vb_bundle["load"] = early_load_ops
+        self.add_bundle(vb_bundle)
 
         # Preload tree[1], tree[2] for round 1 optimization (idx in {1,2} after round 0)
         left_scalar = self.alloc_scratch("left_scalar")
@@ -200,7 +262,7 @@ class KernelBuilder:
         delta_5_6_vec = self.alloc_scratch("delta_5_6_vec", VLEN)  # tree6 - tree5
 
         # OPTIMIZED: Pack diff_1_2/three_vec with tree3-6 ALU ops (saves 1 cycle)
-        self.add_bundle({
+        tree_alu_bundle = {
             "valu": [
                 ("-", delta_lr_vec, right_vec, left_vec),
                 ("vbroadcast", three_vec, const_three),
@@ -211,7 +273,11 @@ class KernelBuilder:
                 ("+", node5_scalar, self.scratch["forest_values_p"], const_five),
                 ("+", node6_scalar, self.scratch["forest_values_p"], const_six),
             ],
-        })
+        }
+        early_load_ops = take_early_loads()
+        if early_load_ops:
+            tree_alu_bundle["load"] = early_load_ops
+        self.add_bundle(tree_alu_bundle)
         # OPTIMIZED: Pack loads 2 per cycle
         # OPTIMIZED: Overlap loads with broadcasts - load tree3,4, then load tree5,6 with broadcast tree3,4
         self.add_bundle({"load": [
@@ -229,11 +295,15 @@ class KernelBuilder:
             ],
         })
         # Broadcast tree5,6 and compute diff_3_4 (all VALU)
-        self.add_bundle({"valu": [
+        tree56_bundle = {"valu": [
             ("vbroadcast", node5_vec, node5_scalar),
             ("vbroadcast", node6_vec, node6_scalar),
             ("-", delta_3_4_vec, node4_vec, node3_vec),
-        ]})
+        ]}
+        early_load_ops = take_early_loads()
+        if early_load_ops:
+            tree56_bundle["load"] = early_load_ops
+        self.add_bundle(tree56_bundle)
         # diff_5_6 will be deferred to combine with first hash const load below
         deferred_delta_5_6 = ("-", delta_5_6_vec, node6_vec, node5_vec)
 
@@ -305,50 +375,6 @@ class KernelBuilder:
             else:
                 hash_mul_vecs.append(None)
 
-        # Setup for block offset loading
-        vec_batch_temp = (batch_size // VLEN) * VLEN
-        offset_values = list(range(0, vec_batch_temp, VLEN))  # 0, 8, 16, ..., 248
-
-        # Allocate all block offset addresses upfront
-        offset_addrs = []
-        for i, off in enumerate(offset_values):
-            if off == 0:
-                addr = zero_const
-            else:
-                addr = self.alloc_scratch(f"block_off_{i}")
-                self.const_map[off] = addr
-            offset_addrs.append(addr)
-
-        # Load only base offsets (every 4th); compute the rest with ALU adds.
-        offset_base_indices = list(range(0, len(offset_values), 4))
-        base_load_indices = [
-            i for i in offset_base_indices if offset_addrs[i] != zero_const
-        ]
-        eight_const = self.alloc_scratch("eight_const")
-        sixteen_const = self.alloc_scratch("sixteen_const")
-        twentyfour_const = self.alloc_scratch("twentyfour_const")
-        self.const_map[8] = eight_const
-        self.const_map[16] = sixteen_const
-        self.const_map[24] = twentyfour_const
-        offset_loads = [
-            (eight_const, 8),
-            (sixteen_const, 16),
-            (twentyfour_const, 24),
-        ]
-        offset_loads.extend((offset_addrs[i], offset_values[i]) for i in base_load_indices)
-
-        base_addr_set = set()
-        base_targets = {}
-        for base_idx in offset_base_indices:
-            base_addr = offset_addrs[base_idx]
-            base_addr_set.add(base_addr)
-            base_targets[base_addr] = (
-                offset_addrs[base_idx + 1],
-                offset_addrs[base_idx + 2],
-                offset_addrs[base_idx + 3],
-            )
-        const_addr_set = {eight_const, sixteen_const, twentyfour_const}
-
         # Phase 3: Interleave vbroadcasts with block offset loads
         # We have 12 vbroadcasts (6 c1 + 6 c3) and 3 mul broadcasts = 15 valu ops
         # Plus 11 block offset const loads (base offsets + 8/16/24 constants)
@@ -367,11 +393,11 @@ class KernelBuilder:
         bc_idx = 0
         const_idx = 0
         pending_offset_ops = []
-        loaded_base_addrs = set()
+        loaded_base_addrs = set(early_loaded_base_addrs)
         if offset_addrs[0] == zero_const:
             loaded_base_addrs.add(offset_addrs[0])
         enqueued_base_addrs = set()
-        loaded_const_addrs = set()
+        loaded_const_addrs = set(early_loaded_const_addrs)
         while bc_idx < len(broadcast_queue) or const_idx < len(offset_loads) or pending_offset_ops:
             bundle = {}
 
@@ -643,7 +669,6 @@ class KernelBuilder:
                     elif phase == "round2_select5":
                         valu_tasks.append((6, 1, block, "round2_select5"))  # node
                     elif phase == "addr":
-                        # Optimized priority (5) for better scheduling
                         valu_tasks.append((5, 1, block, "addr"))
 
                 # Sort by priority (lower = higher priority)
