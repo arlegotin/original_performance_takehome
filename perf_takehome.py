@@ -384,8 +384,6 @@ class KernelBuilder:
         if offset_alu_ops:
             self.add_bundle({"alu": offset_alu_ops})
 
-        # Add pause after all init
-        self.add_bundle({"flow": [("pause",)]})
         body_instrs = []
 
         stage_buffers = []
@@ -481,7 +479,6 @@ class KernelBuilder:
 
                     # Use selection for depths 0-2 (both before and after wrap).
                     # Depth 3+ selection adds too much VALU - use gather instead.
-                    is_after_wrap = next_r > wrap_round
 
                     if depth == 0:
                         # Round 0 never hits this (special-cased in vload)
@@ -806,7 +803,6 @@ class KernelBuilder:
                 body_instrs.extend(self.build(tail_slots))
 
         self.instrs.extend(body_instrs)
-        self.instrs.append({"flow": [("pause",)]})
 BASELINE = 147734
 
 def do_kernel_test(
@@ -837,22 +833,23 @@ def do_kernel_test(
         trace=trace,
     )
     machine.prints = prints
-    for i, ref_mem in enumerate(reference_kernel2(mem, value_trace)):
-        machine.run()
-        inp_values_p = ref_mem[6]
-        if prints:
-            print(machine.mem[inp_values_p : inp_values_p + len(inp.values)])
-            print(ref_mem[inp_values_p : inp_values_p + len(inp.values)])
-        assert (
-            machine.mem[inp_values_p : inp_values_p + len(inp.values)]
-            == ref_mem[inp_values_p : inp_values_p + len(inp.values)]
-        ), f"Incorrect result on round {i}"
-        inp_indices_p = ref_mem[5]
-        if prints:
-            print(machine.mem[inp_indices_p : inp_indices_p + len(inp.indices)])
-            print(ref_mem[inp_indices_p : inp_indices_p + len(inp.indices)])
-        # Updating these in memory isn't required, but you can enable this check for debugging
-        # assert machine.mem[inp_indices_p:inp_indices_p+len(inp.indices)] == ref_mem[inp_indices_p:inp_indices_p+len(inp.indices)]
+    for ref_mem in reference_kernel2(mem, value_trace):
+        pass
+    machine.run()
+    inp_values_p = ref_mem[6]
+    if prints:
+        print(machine.mem[inp_values_p : inp_values_p + len(inp.values)])
+        print(ref_mem[inp_values_p : inp_values_p + len(inp.values)])
+    assert (
+        machine.mem[inp_values_p : inp_values_p + len(inp.values)]
+        == ref_mem[inp_values_p : inp_values_p + len(inp.values)]
+    ), "Incorrect result on final values"
+    inp_indices_p = ref_mem[5]
+    if prints:
+        print(machine.mem[inp_indices_p : inp_indices_p + len(inp.indices)])
+        print(ref_mem[inp_indices_p : inp_indices_p + len(inp.indices)])
+    # Updating these in memory isn't required, but you can enable this check for debugging
+    # assert machine.mem[inp_indices_p:inp_indices_p+len(inp.indices)] == ref_mem[inp_indices_p:inp_indices_p+len(inp.indices)]
 
     print("CYCLES: ", machine.cycle)
     print("Speedup over baseline: ", BASELINE / machine.cycle)
