@@ -1,3 +1,7 @@
+# Live updates 🔴
+- 1472 (21 Jan, 20:01 CET)
+- 1474 (21 Jan, 19:20 CET)
+
 # Anthropic's Original Performance Take-Home
 
 This repo contains a version of Anthropic's original performance take-home, before Claude Opus 4.5 started doing better than humans given only 2 hours.
