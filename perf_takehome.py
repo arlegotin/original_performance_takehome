@@ -311,15 +311,18 @@ class KernelBuilder:
 
         # Allocate all block offset addresses upfront
         offset_addrs = []
-        for i in range(len(offset_values)):
-            addr = self.alloc_scratch(f"block_off_{i}")
-            self.const_map[offset_values[i]] = addr
+        for i, off in enumerate(offset_values):
+            if off == 0:
+                addr = zero_const
+            else:
+                addr = self.alloc_scratch(f"block_off_{i}")
+                self.const_map[off] = addr
             offset_addrs.append(addr)
 
         # Load only base offsets (every 4th); compute the rest with ALU adds.
         offset_base_indices = list(range(0, len(offset_values), 4))
-        offset_loads = [
-            (offset_addrs[i], offset_values[i]) for i in offset_base_indices
+        base_load_indices = [
+            i for i in offset_base_indices if offset_addrs[i] != zero_const
         ]
         eight_const = self.alloc_scratch("eight_const")
         sixteen_const = self.alloc_scratch("sixteen_const")
@@ -327,9 +330,24 @@ class KernelBuilder:
         self.const_map[8] = eight_const
         self.const_map[16] = sixteen_const
         self.const_map[24] = twentyfour_const
-        offset_loads.append((eight_const, 8))
-        offset_loads.append((sixteen_const, 16))
-        offset_loads.append((twentyfour_const, 24))
+        offset_loads = [
+            (eight_const, 8),
+            (sixteen_const, 16),
+            (twentyfour_const, 24),
+        ]
+        offset_loads.extend((offset_addrs[i], offset_values[i]) for i in base_load_indices)
+
+        base_addr_set = set()
+        base_targets = {}
+        for base_idx in offset_base_indices:
+            base_addr = offset_addrs[base_idx]
+            base_addr_set.add(base_addr)
+            base_targets[base_addr] = (
+                offset_addrs[base_idx + 1],
+                offset_addrs[base_idx + 2],
+                offset_addrs[base_idx + 3],
+            )
+        const_addr_set = {eight_const, sixteen_const, twentyfour_const}
 
         # Phase 3: Interleave vbroadcasts with block offset loads
         # We have 12 vbroadcasts (6 c1 + 6 c3) and 3 mul broadcasts = 15 valu ops
@@ -348,7 +366,13 @@ class KernelBuilder:
         # Pack: 2 const loads + 6 vbroadcasts per cycle while we have both
         bc_idx = 0
         const_idx = 0
-        while bc_idx < len(broadcast_queue) or const_idx < len(offset_loads):
+        pending_offset_ops = []
+        loaded_base_addrs = set()
+        if offset_addrs[0] == zero_const:
+            loaded_base_addrs.add(offset_addrs[0])
+        enqueued_base_addrs = set()
+        loaded_const_addrs = set()
+        while bc_idx < len(broadcast_queue) or const_idx < len(offset_loads) or pending_offset_ops:
             bundle = {}
 
             # Add up to 6 vbroadcasts
@@ -361,28 +385,43 @@ class KernelBuilder:
 
             # Add up to 2 const loads
             load_ops = []
+            loaded_bases_this_cycle = []
+            loaded_consts_this_cycle = []
             while len(load_ops) < 2 and const_idx < len(offset_loads):
                 addr, val = offset_loads[const_idx]
                 load_ops.append(("const", addr, val))
+                if addr in base_addr_set:
+                    loaded_bases_this_cycle.append(addr)
+                elif addr in const_addr_set:
+                    loaded_consts_this_cycle.append(addr)
                 const_idx += 1
             if load_ops:
                 bundle["load"] = load_ops
 
+            # Add up to 12 ALU ops for derived offsets
+            alu_ops = []
+            while pending_offset_ops and len(alu_ops) < SLOT_LIMITS["alu"]:
+                alu_ops.append(pending_offset_ops.pop(0))
+            if alu_ops:
+                bundle["alu"] = alu_ops
+
             if bundle:
                 self.add_bundle(bundle)
 
-        # Compute remaining block offsets using ALU adds from the base offsets.
-        offset_alu_ops = []
-        for base_idx in offset_base_indices:
-            base_addr = offset_addrs[base_idx]
-            offset_alu_ops.append(("+", offset_addrs[base_idx + 1], base_addr, eight_const))
-            offset_alu_ops.append(("+", offset_addrs[base_idx + 2], base_addr, sixteen_const))
-            offset_alu_ops.append(("+", offset_addrs[base_idx + 3], base_addr, twentyfour_const))
-            if len(offset_alu_ops) == SLOT_LIMITS["alu"]:
-                self.add_bundle({"alu": offset_alu_ops})
-                offset_alu_ops = []
-        if offset_alu_ops:
-            self.add_bundle({"alu": offset_alu_ops})
+            loaded_base_addrs.update(loaded_bases_this_cycle)
+            loaded_const_addrs.update(loaded_consts_this_cycle)
+            constants_ready = len(loaded_const_addrs) == len(const_addr_set)
+            if constants_ready:
+                for base_addr in loaded_base_addrs:
+                    if base_addr in enqueued_base_addrs:
+                        continue
+                    t1, t2, t3 = base_targets[base_addr]
+                    pending_offset_ops.extend([
+                        ("+", t1, base_addr, eight_const),
+                        ("+", t2, base_addr, sixteen_const),
+                        ("+", t3, base_addr, twentyfour_const),
+                    ])
+                    enqueued_base_addrs.add(base_addr)
 
         body_instrs = []
 
