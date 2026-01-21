@@ -1,6 +1,7 @@
 # Live updates 🔴
-- 1472 (21 Jan, 20:01 CET)
-- 1474 (21 Jan, 19:20 CET)
+- **1470** (21 Jan, 20:30 CET)
+- **1472** (21 Jan, 20:01 CET)
+- **1474** (21 Jan, 19:20 CET)
 
 # Anthropic's Original Performance Take-Home
 

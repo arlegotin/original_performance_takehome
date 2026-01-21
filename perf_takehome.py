@@ -639,6 +639,18 @@ class KernelBuilder:
                             continue
                         continue
 
+                    if phase == "update1":
+                        # If ALU slots are available, offload the parity AND to scalar ALU.
+                        if alu_slots >= VLEN and valu_slots >= 1:
+                            for lane in range(VLEN):
+                                alu_ops.append(("&", buf["tmp1"] + lane, buf["val"] + lane, one_const))
+                            alu_slots -= VLEN
+                            valu_ops.append(("multiply_add", buf["idx"], buf["idx"], two_v, one_v))
+                            valu_slots -= 1
+                            block["next_phase"] = "update2"
+                            scheduled_this_cycle.add(block["block"])
+                            continue
+
                     if valu_slots < cost:
                         continue
 
