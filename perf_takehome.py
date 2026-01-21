@@ -649,7 +649,7 @@ class KernelBuilder:
                     elif phase == "hash_op2":
                         valu_tasks.append((5, 1, block, "hash_op2"))
                     elif phase == "hash_mul":
-                        valu_tasks.append((3, 1, block, "hash_mul"))
+                        valu_tasks.append((7, 1, block, "hash_mul"))
                     elif phase == "hash_op1":
                         valu_tasks.append((5, 1, block, "hash_op1"))
                     elif phase == "xor":
