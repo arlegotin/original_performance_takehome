@@ -344,7 +344,7 @@ class KernelBuilder:
             self.vector_cache[value] = vec_addr
         return self.vector_cache[value]
 
-    def build_kernel(self, tree_depth, _node_count, items, num_rounds, tile_blocks=17, tile_rounds=13):
+    def build_kernel(self, tree_depth, _node_count, items, num_rounds, tile_blocks=18, tile_rounds=13):
         """
         Generate the optimized kernel.
 
@@ -476,10 +476,10 @@ class KernelBuilder:
             })
 
         # === MAIN COMPUTATION LOOP ===
-        for group_base in range(0, num_blocks, tile_blocks):
-            for round_base in range(0, num_rounds, tile_rounds):
-                round_limit = min(num_rounds, round_base + tile_rounds)
+        for round_base in range(0, num_rounds, tile_rounds):
+            round_limit = min(num_rounds, round_base + tile_rounds)
 
+            for group_base in range(0, num_blocks, tile_blocks):
                 for buf_idx in range(tile_blocks):
                     blk = group_base + buf_idx
                     if blk >= num_blocks:
