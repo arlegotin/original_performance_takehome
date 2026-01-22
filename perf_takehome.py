@@ -16,7 +16,7 @@ anything in the tests/ folder.
 We recommend you look through problem.py next.
 """
 
-from collections import defaultdict
+import heapq
 import random
 import unittest
 
@@ -39,28 +39,22 @@ from problem import (
 
 class KernelBuilder:
     def __init__(self):
-        self.instrs = []
         self.scratch = {}
         self.scratch_debug = {}
         self.scratch_ptr = 0
         self.const_map = {}
+        self.vconst_map = {}
+        self.engines = []
+        self.slots = []
+        self.succs = []
+        self.indeg = []
+        self.last_writer = {}
+        self.last_reader = {}
+        self.war_addrs = set()
+        self.instrs = []
 
     def debug_info(self):
         return DebugInfo(scratch_map=self.scratch_debug)
-
-    def build(self, slots: list[tuple[Engine, tuple]], vliw: bool = False):
-        # Simple slot packing that just uses one slot per instruction bundle
-        instrs = []
-        for engine, slot in slots:
-            instrs.append({engine: [slot]})
-        return instrs
-
-    def add(self, engine, slot):
-        self.instrs.append({engine: [slot]})
-
-    def add_bundle(self, bundle):
-        """Add a packed instruction bundle: {engine: [slots]}."""
-        self.instrs.append(bundle)
 
     def alloc_scratch(self, name=None, length=1):
         addr = self.scratch_ptr
@@ -71,761 +65,332 @@ class KernelBuilder:
         assert self.scratch_ptr <= SCRATCH_SIZE, "Out of scratch space"
         return addr
 
-    def scratch_const(self, val, name=None):
+    def _vec_range(self, base):
+        return list(range(base, base + VLEN))
+
+    def rw(self, engine, slot):
+        if engine == "alu":
+            _, dest, a1, a2 = slot
+            return [a1, a2], [dest]
+        if engine == "load":
+            match slot:
+                case ("const", dest, _val):
+                    return [], [dest]
+                case ("load", dest, addr):
+                    return [addr], [dest]
+                case ("vload", dest, addr):
+                    return [addr], self._vec_range(dest)
+                case ("load_offset", dest, addr, offset):
+                    return [addr + offset], [dest + offset]
+                case _:
+                    raise NotImplementedError(f"Unknown load op {slot}")
+        if engine == "valu":
+            match slot:
+                case ("vbroadcast", dest, src):
+                    return [src], self._vec_range(dest)
+                case ("multiply_add", dest, a, b, c):
+                    reads = self._vec_range(a) + self._vec_range(b) + self._vec_range(c)
+                    return reads, self._vec_range(dest)
+                case (op, dest, a1, a2):
+                    reads = self._vec_range(a1) + self._vec_range(a2)
+                    return reads, self._vec_range(dest)
+                case _:
+                    raise NotImplementedError(f"Unknown valu op {slot}")
+        if engine == "store":
+            match slot:
+                case ("vstore", addr, src):
+                    reads = [addr] + self._vec_range(src)
+                    return reads, []
+                case ("store", addr, src):
+                    return [addr, src], []
+                case _:
+                    raise NotImplementedError(f"Unknown store op {slot}")
+        raise NotImplementedError(f"Unknown engine {engine}")
+
+    def emit_op(self, engine, slot):
+        reads, writes = self.rw(engine, slot)
+        deps = set()
+        for r in reads:
+            if r in self.last_writer:
+                deps.add(self.last_writer[r])
+            if r in self.war_addrs and r in self.last_reader:
+                deps.add(self.last_reader[r])
+        for w in writes:
+            if w in self.last_writer:
+                deps.add(self.last_writer[w])
+            if w in self.war_addrs and w in self.last_reader:
+                deps.add(self.last_reader[w])
+        op_id = len(self.engines)
+        self.engines.append(engine)
+        self.slots.append(slot)
+        self.succs.append([])
+        self.indeg.append(len(deps))
+        for dep in deps:
+            self.succs[dep].append(op_id)
+        for r in reads:
+            if r in self.war_addrs:
+                self.last_reader[r] = op_id
+        for w in writes:
+            self.last_writer[w] = op_id
+            if w in self.war_addrs and w in self.last_reader:
+                del self.last_reader[w]
+        return op_id
+
+    def const(self, val, name=None):
         if val not in self.const_map:
             addr = self.alloc_scratch(name)
-            self.add("load", ("const", addr, val))
+            self.emit_op("load", ("const", addr, val))
             self.const_map[val] = addr
         return self.const_map[val]
 
-    def build_hash(self, val_hash_addr, tmp1, tmp2, round, i):
-        slots = []
+    def vconst(self, val, name=None):
+        if val in self.vconst_map:
+            return self.vconst_map[val]
+        scalar = self.const(val, name=name)
+        vec = self.alloc_scratch(f"{name}_vec" if name else None, VLEN)
+        self.emit_op("valu", ("vbroadcast", vec, scalar))
+        self.vconst_map[val] = vec
+        return vec
 
-        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-            slots.append(("alu", (op1, tmp1, val_hash_addr, self.scratch_const(val1))))
-            slots.append(("alu", (op3, tmp2, val_hash_addr, self.scratch_const(val3))))
-            slots.append(("alu", (op2, val_hash_addr, tmp1, tmp2)))
-            slots.append(("debug", ("compare", val_hash_addr, (round, i, "hash_stage", hi))))
+    def vbroadcast(self, src, name=None):
+        vec = self.alloc_scratch(f"{name}_vec" if name else None, VLEN)
+        self.emit_op("valu", ("vbroadcast", vec, src))
+        return vec
 
-        return slots
+    def schedule(self):
+        n_ops = len(self.engines)
+        inf = n_ops + 1
+        load_dist = [inf] * n_ops
+        for op_id in range(n_ops - 1, -1, -1):
+            if self.engines[op_id] == "load":
+                load_dist[op_id] = 0
+            for succ in self.succs[op_id]:
+                cand = load_dist[succ] + 1
+                if cand < load_dist[op_id]:
+                    load_dist[op_id] = cand
 
+        indeg = self.indeg.copy()
+        ready = {}
+        for engine in SLOT_LIMITS:
+            if engine == "debug":
+                continue
+            ready[engine] = []
+
+        def perm(engine, op_id):
+            if engine == "load":
+                return (op_id ^ (op_id >> 1)) & 0xFFFF
+            if engine == "alu":
+                return op_id
+            if engine == "valu":
+                return -op_id
+            return op_id
+
+        for op_id, deg in enumerate(indeg):
+            if deg == 0:
+                engine = self.engines[op_id]
+                heapq.heappush(
+                    ready[engine],
+                    (load_dist[op_id], perm(engine, op_id), op_id),
+                )
+
+        instrs = []
+        while any(ready[engine] for engine in ready):
+            bundle = {}
+            next_ready = {engine: [] for engine in ready}
+            for engine, limit in SLOT_LIMITS.items():
+                if engine == "debug":
+                    continue
+                slots = []
+                for _ in range(limit):
+                    if not ready[engine]:
+                        break
+                    _, _, op_id = heapq.heappop(ready[engine])
+                    slots.append(op_id)
+                if slots:
+                    bundle[engine] = [self.slots[op_id] for op_id in slots]
+                    for op_id in slots:
+                        for succ in self.succs[op_id]:
+                            indeg[succ] -= 1
+                            if indeg[succ] == 0:
+                                succ_engine = self.engines[succ]
+                                heapq.heappush(
+                                    next_ready[succ_engine],
+                                    (
+                                        load_dist[succ],
+                                        perm(succ_engine, succ),
+                                        succ,
+                                    ),
+                                )
+            if bundle:
+                instrs.append(bundle)
+            for engine in ready:
+                if next_ready[engine]:
+                    for item in next_ready[engine]:
+                        heapq.heappush(ready[engine], item)
+        self.instrs = instrs
 
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
-        tmp1 = self.alloc_scratch("tmp1")
-        tmp2 = self.alloc_scratch("tmp2")
-        tmp3 = self.alloc_scratch("tmp3")
-        init_vars = ["rounds", "n_nodes", "batch_size", "forest_height"]
-        for v in init_vars:
-            self.alloc_scratch(v, 1)
-        forest_values_p = self.alloc_scratch("forest_values_p")
-        inp_indices_p = self.alloc_scratch("inp_indices_p")
-        inp_values_p = self.alloc_scratch("inp_values_p")
-        # OPTIMIZED: Use different temp addresses to pack parameter loads
-        # Pairs: (rounds,0), (n_nodes,1), (batch_size,2), (forest_height,3)
-        tmp_addrs = [tmp1, tmp2, tmp1, tmp2]  # Alternate between tmp1 and tmp2
-        for i in range(0, len(init_vars), 2):
-            # Pack 2 const loads
-            self.add_bundle({"load": [("const", tmp_addrs[i], i), ("const", tmp_addrs[i+1], i+1)]})
-            # Pack 2 memory loads
-            self.add_bundle({"load": [
-                ("load", self.scratch[init_vars[i]], tmp_addrs[i]),
-                ("load", self.scratch[init_vars[i+1]], tmp_addrs[i+1]),
-            ]})
+        """
+        Vectorized kernel with DAG scheduling and multiply_add folding.
+        """
+        n_groups = batch_size // VLEN
+
+        idx_base = self.alloc_scratch("idx", batch_size)
+        val_base = self.alloc_scratch("val", batch_size)
+        node_base = self.alloc_scratch("node", batch_size)
+        tmp_base = self.alloc_scratch("tmp", batch_size)
+        aux_base = self.alloc_scratch("aux", batch_size)
+        idx_addr_base = self.alloc_scratch("idx_addr", n_groups)
+        val_addr_base = self.alloc_scratch("val_addr", n_groups)
+
+        self.war_addrs = set(range(node_base, node_base + batch_size))
+        self.war_addrs.update(range(tmp_base, tmp_base + batch_size))
+
+        forest_base = self.const(7, "forest_base")
+        zero = self.const(0, "zero")
+        forest_base_vec = self.vconst(7, "forest_base")
+        shift1 = self.const(1, "shift1")
+        shift9 = self.const(9, "shift9")
+        shift16 = self.const(16, "shift16")
+        shift19 = self.const(19, "shift19")
+        vlen = self.const(VLEN, "vlen")
+        one_vec = self.vconst(1, "one")
+        two_vec = self.vconst(2, "two")
+        three_vec = self.vconst(3, "three")
+
+        mul4097_vec = self.vconst(1 + (1 << 12), "mul4097")
+        mul33_vec = self.vconst(1 + (1 << 5), "mul33")
+        mul9_vec = self.vconst(1 + (1 << 3), "mul9")
+        add1_vec = self.vconst(0x7ED55D16, "add1")
+        xor2_vec = self.vconst(0xC761C23C, "xor2")
+        add3_vec = self.vconst(0x165667B1, "add3")
+        add4_vec = self.vconst(0xD3A2646C, "add4")
+        add5_vec = self.vconst(0xFD7046C5, "add5")
+        xor6_vec = self.vconst(0xB55A4F09, "xor6")
+
+        def emit_shift(op, dest_vec, src_vec, shift_scalar):
+            for lane in range(VLEN):
+                self.emit_op(
+                    "alu",
+                    (op, dest_vec + lane, src_vec + lane, shift_scalar),
+                )
+
+
+        top_nodes = self.alloc_scratch("top_nodes", VLEN)
+        self.emit_op("load", ("vload", top_nodes, forest_base))
+
+        d12 = self.alloc_scratch("d12")
+        d34 = self.alloc_scratch("d34")
+        d56 = self.alloc_scratch("d56")
+        self.emit_op("alu", ("^", d12, top_nodes + 1, top_nodes + 2))
+        self.emit_op("alu", ("^", d34, top_nodes + 3, top_nodes + 4))
+        self.emit_op("alu", ("^", d56, top_nodes + 5, top_nodes + 6))
+
+        node0_vec = self.vbroadcast(top_nodes + 0, "node0")
+        node2_vec = self.vbroadcast(top_nodes + 2, "node2")
+        node3_vec = self.vbroadcast(top_nodes + 3, "node3")
+        node5_vec = self.vbroadcast(top_nodes + 5, "node5")
+        d12_vec = self.vbroadcast(d12, "d12")
+        d34_vec = self.vbroadcast(d34, "d34")
+        d56_vec = self.vbroadcast(d56, "d56")
+
+        inp_indices_p = 7 + n_nodes
+        inp_values_p = inp_indices_p + batch_size
+
+        self.emit_op("load", ("const", idx_addr_base + 0, inp_indices_p))
+        self.emit_op("load", ("const", val_addr_base + 0, inp_values_p))
+        for g in range(1, n_groups):
+            self.emit_op("alu", ("+", idx_addr_base + g, idx_addr_base + g - 1, vlen))
+            self.emit_op("alu", ("+", val_addr_base + g, val_addr_base + g - 1, vlen))
+
+        for g in range(n_groups):
+            idx_addr = idx_addr_base + g
+            val_addr = val_addr_base + g
+            idx_vec = idx_base + g * VLEN
+            val_vec = val_base + g * VLEN
+            self.emit_op("valu", ("vbroadcast", idx_vec, zero))
+            self.emit_op("load", ("vload", val_vec, val_addr))
+
+        for r in range(rounds):
+            depth = r % (forest_height + 1)
+            for g in range(n_groups):
+                idx_vec = idx_base + g * VLEN
+                val_vec = val_base + g * VLEN
+                node_vec = node_base + g * VLEN
+                tmp_vec = tmp_base + g * VLEN
+                aux_vec = aux_base + g * VLEN
+
+                if depth >= 3:
+                    self.emit_op("valu", ("+", aux_vec, idx_vec, forest_base_vec))
+                    for off in range(VLEN):
+                        self.emit_op(
+                            "load",
+                            ("load_offset", node_vec, aux_vec, off),
+                        )
+                    self.emit_op("valu", ("^", val_vec, val_vec, node_vec))
+                elif depth == 0:
+                    self.emit_op("valu", ("^", val_vec, val_vec, node0_vec))
+                elif depth == 1:
+                    self.emit_op("valu", ("&", tmp_vec, idx_vec, one_vec))
+                    self.emit_op("valu", ("*", node_vec, d12_vec, tmp_vec))
+                    self.emit_op("valu", ("^", val_vec, val_vec, node2_vec))
+                    self.emit_op("valu", ("^", val_vec, val_vec, node_vec))
+                else:
+                    self.emit_op("valu", ("-", aux_vec, idx_vec, three_vec))
+                    self.emit_op("valu", ("&", node_vec, aux_vec, one_vec))
+                    self.emit_op("valu", ("*", tmp_vec, d34_vec, node_vec))
+                    self.emit_op("valu", ("^", tmp_vec, tmp_vec, node3_vec))
+                    self.emit_op("valu", ("*", node_vec, d56_vec, node_vec))
+                    self.emit_op("valu", ("^", node_vec, node_vec, node5_vec))
+                    self.emit_op("valu", ("^", val_vec, val_vec, tmp_vec))
+                    self.emit_op("valu", ("^", node_vec, node_vec, tmp_vec))
+                    emit_shift(">>", tmp_vec, aux_vec, shift1)
+                    self.emit_op("valu", ("*", node_vec, node_vec, tmp_vec))
+                    self.emit_op("valu", ("^", val_vec, val_vec, node_vec))
+
+                self.emit_op(
+                    "valu",
+                    ("multiply_add", val_vec, val_vec, mul4097_vec, add1_vec),
+                )
+                emit_shift(">>", tmp_vec, val_vec, shift19)
+                self.emit_op("valu", ("^", tmp_vec, tmp_vec, xor2_vec))
+                self.emit_op("valu", ("^", val_vec, val_vec, tmp_vec))
+                self.emit_op(
+                    "valu",
+                    ("multiply_add", val_vec, val_vec, mul33_vec, add3_vec),
+                )
+                emit_shift("<<", tmp_vec, val_vec, shift9)
+                self.emit_op("valu", ("+", node_vec, val_vec, add4_vec))
+                self.emit_op("valu", ("^", val_vec, node_vec, tmp_vec))
+                self.emit_op(
+                    "valu",
+                    ("multiply_add", val_vec, val_vec, mul9_vec, add5_vec),
+                )
+                emit_shift(">>", tmp_vec, val_vec, shift16)
+                self.emit_op("valu", ("^", tmp_vec, tmp_vec, xor6_vec))
+                self.emit_op("valu", ("^", val_vec, val_vec, tmp_vec))
+
+                if depth == forest_height:
+                    self.emit_op(
+                        "valu", ("^", idx_vec, idx_vec, idx_vec)
+                    )
+                else:
+                    self.emit_op("valu", ("&", tmp_vec, val_vec, one_vec))
+                    self.emit_op("valu", ("+", tmp_vec, tmp_vec, one_vec))
+                    self.emit_op(
+                        "valu", ("multiply_add", idx_vec, idx_vec, two_vec, tmp_vec)
+                    )
+
+        for g in range(n_groups):
+            idx_vec = idx_base + g * VLEN
+            val_vec = val_base + g * VLEN
+            self.emit_op("store", ("vstore", idx_addr_base + g, idx_vec))
+            self.emit_op("store", ("vstore", val_addr_base + g, val_vec))
+
+        self.schedule()
 
-        # OPTIMIZED: Pack const 0,1,2 loads with forest pointer setup
-        zero_const = self.alloc_scratch("zero_const")
-        one_const = self.alloc_scratch("one_const")
-        two_const = self.alloc_scratch("two_const")
-        self.const_map[0] = zero_const
-        self.const_map[1] = one_const
-        self.const_map[2] = two_const
-        # Preload tree[0] for round 0 optimization
-        nodes0_7 = self.alloc_scratch("nodes0_7", VLEN)
-        root_vec = self.alloc_scratch("root_vec", VLEN)
-        # Use fixed forest base (header size) to derive pointers
-        self.add_bundle({"load": [("const", forest_values_p, 7), ("const", zero_const, 0)]})
-        self.add_bundle({"load": [("const", one_const, 1), ("vload", nodes0_7, forest_values_p)]})
-        self.add_bundle({
-            "load": [("const", two_const, 2)],
-            "alu": [("+", inp_indices_p, forest_values_p, self.scratch["n_nodes"])],
-        })
-        self.add_bundle({"alu": [("+", inp_values_p, inp_indices_p, self.scratch["batch_size"])]})
-
-        zero_v = self.alloc_scratch("zero_v", VLEN)
-        one_v = self.alloc_scratch("one_v", VLEN)
-        two_v = self.alloc_scratch("two_v", VLEN)
-        n_nodes_v = self.alloc_scratch("n_nodes_v", VLEN)
-        forest_base_v = self.alloc_scratch("forest_base_v", VLEN)
-        # Early block offset setup to overlap const loads with init bundles.
-        vec_batch_temp = (batch_size // VLEN) * VLEN
-        offset_values = list(range(0, vec_batch_temp, VLEN))  # 0, 8, 16, ..., 248
-
-        # Allocate all block offset addresses upfront
-        offset_addrs = []
-        for i, off in enumerate(offset_values):
-            if off == 0:
-                addr = zero_const
-            else:
-                addr = self.alloc_scratch(f"block_off_{i}")
-                self.const_map[off] = addr
-            offset_addrs.append(addr)
-
-        # Load only base offsets (every 4th); compute the rest with ALU adds.
-        offset_base_indices = list(range(0, len(offset_values), 4))
-        base_load_indices = [
-            i for i in offset_base_indices if offset_addrs[i] != zero_const
-        ]
-        eight_const = self.alloc_scratch("eight_const")
-        sixteen_const = self.alloc_scratch("sixteen_const")
-        twentyfour_const = self.alloc_scratch("twentyfour_const")
-        self.const_map[8] = eight_const
-        self.const_map[16] = sixteen_const
-        self.const_map[24] = twentyfour_const
-        offset_loads = [
-            (eight_const, 8),
-            (sixteen_const, 16),
-            (twentyfour_const, 24),
-        ]
-        offset_loads.extend((offset_addrs[i], offset_values[i]) for i in base_load_indices)
-
-        base_addr_set = set()
-        base_targets = {}
-        for base_idx in offset_base_indices:
-            base_addr = offset_addrs[base_idx]
-            base_addr_set.add(base_addr)
-            base_targets[base_addr] = (
-                offset_addrs[base_idx + 1],
-                offset_addrs[base_idx + 2],
-                offset_addrs[base_idx + 3],
-            )
-        const_addr_set = {eight_const, sixteen_const, twentyfour_const}
-
-        early_load_count = min(6, len(offset_loads))
-        early_offset_loads = offset_loads[:early_load_count]
-        offset_loads = offset_loads[early_load_count:]
-        early_loaded_base_addrs = {addr for addr, _ in early_offset_loads if addr in base_addr_set}
-        early_loaded_const_addrs = {addr for addr, _ in early_offset_loads if addr in const_addr_set}
-        early_load_queue = list(early_offset_loads)
-
-        def take_early_loads():
-            loads = []
-            while len(loads) < 2 and early_load_queue:
-                addr, val = early_load_queue.pop(0)
-                loads.append(("const", addr, val))
-            return loads
-
-        # OPTIMIZED: Pack 6 vbroadcasts into 1 cycle (root_vec added since root_scalar already loaded)
-        vb_bundle = {"valu": [
-            ("vbroadcast", zero_v, zero_const),
-            ("vbroadcast", one_v, one_const),
-            ("vbroadcast", two_v, two_const),
-            ("vbroadcast", n_nodes_v, self.scratch["n_nodes"]),
-            ("vbroadcast", forest_base_v, self.scratch["forest_values_p"]),
-            ("vbroadcast", root_vec, nodes0_7 + 0),
-        ]}
-        early_load_ops = take_early_loads()
-        if early_load_ops:
-            vb_bundle["load"] = early_load_ops
-        self.add_bundle(vb_bundle)
-
-        # Preload tree[1], tree[2] for round 1 optimization (idx in {1,2} after round 0)
-        left_vec = self.alloc_scratch("left_vec", VLEN)
-        right_vec = self.alloc_scratch("right_vec", VLEN)
-        delta_lr_vec = self.alloc_scratch("delta_lr_vec", VLEN)  # tree2 - tree1
-        const_three = self.alloc_scratch("const_three")
-        self.const_map[3] = const_three
-        self.add_bundle({"load": [("const", const_three, 3)]})
-        self.add_bundle({"valu": [
-            ("vbroadcast", left_vec, nodes0_7 + 1),
-            ("vbroadcast", right_vec, nodes0_7 + 2),
-        ]})
-
-        # Preload tree[3..6] for round 2 optimization (idx in {3,4,5,6} after round 1)
-        three_vec = self.alloc_scratch("three_vec", VLEN)
-        node3_vec = self.alloc_scratch("node3_vec", VLEN)
-        node4_vec = self.alloc_scratch("node4_vec", VLEN)
-        node5_vec = self.alloc_scratch("node5_vec", VLEN)
-        node6_vec = self.alloc_scratch("node6_vec", VLEN)
-        delta_3_4_vec = self.alloc_scratch("delta_3_4_vec", VLEN)  # tree4 - tree3
-        delta_5_6_vec = self.alloc_scratch("delta_5_6_vec", VLEN)  # tree6 - tree5
-
-        tree_init_bundle = {"valu": [
-            ("vbroadcast", three_vec, const_three),
-            ("vbroadcast", node3_vec, nodes0_7 + 3),
-            ("vbroadcast", node4_vec, nodes0_7 + 4),
-            ("vbroadcast", node5_vec, nodes0_7 + 5),
-            ("vbroadcast", node6_vec, nodes0_7 + 6),
-            ("-", delta_lr_vec, right_vec, left_vec),
-        ]}
-        early_load_ops = take_early_loads()
-        if early_load_ops:
-            tree_init_bundle["load"] = early_load_ops
-        self.add_bundle(tree_init_bundle)
-
-        tree_delta_bundle = {"valu": [
-            ("-", delta_3_4_vec, node4_vec, node3_vec),
-        ]}
-        early_load_ops = take_early_loads()
-        if early_load_ops:
-            tree_delta_bundle["load"] = early_load_ops
-        self.add_bundle(tree_delta_bundle)
-        # diff_5_6 will be deferred to combine with first hash const load below
-        deferred_delta_5_6 = ("-", delta_5_6_vec, node6_vec, node5_vec)
-
-        # OPTIMIZED: Load all hash constants first, then pack vbroadcasts
-        hash_c1_vecs = []
-        hash_c3_vecs = []
-        hash_c3_lane_scalars = []
-        hash_mul_vecs = []
-
-        # Phase 1: Allocate and load all scalar constants (pack const loads 2 per cycle)
-        hash_c1_scalars = []
-        hash_c3_broadcast_scalars = []
-        hash_mul_scalars = []
-
-        # Collect all const values and addresses first
-        const_load_queue = []  # List of (addr, value)
-        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-            # c1 const
-            if val1 not in self.const_map:
-                addr = self.alloc_scratch(f"hash_c1_s_{hi}")
-                self.const_map[val1] = addr
-                const_load_queue.append((addr, val1))
-            hash_c1_scalars.append(self.const_map[val1])
-
-            # c3 const
-            if val3 not in self.const_map:
-                addr = self.alloc_scratch(f"hash_c3_s_{hi}")
-                self.const_map[val3] = addr
-                const_load_queue.append((addr, val3))
-            hash_c3_broadcast_scalars.append(self.const_map[val3])
-            hash_c3_lane_scalars.append(self.const_map[val3])
-
-            # mul const for fusible stages
-            if op1 == "+" and op2 == "+" and op3 == "<<":
-                mul = (1 + (1 << val3)) % (2**32)
-                if mul not in self.const_map:
-                    addr = self.alloc_scratch(f"hash_mul_s_{hi}")
-                    self.const_map[mul] = addr
-                    const_load_queue.append((addr, mul))
-                hash_mul_scalars.append((hi, self.const_map[mul]))
-            else:
-                hash_mul_scalars.append((hi, None))
-
-        # Pack const loads 2 per cycle, combine first batch with deferred diff_5_6
-        for i in range(0, len(const_load_queue), 2):
-            if i + 1 < len(const_load_queue):
-                bundle = {"load": [
-                    ("const", const_load_queue[i][0], const_load_queue[i][1]),
-                    ("const", const_load_queue[i + 1][0], const_load_queue[i + 1][1]),
-                ]}
-                # Combine diff_5_6 with first batch of const loads (saves 1 cycle)
-                if i == 0 and deferred_delta_5_6:
-                    bundle["valu"] = [deferred_delta_5_6]
-                self.add_bundle(bundle)
-            else:
-                self.add("load", ("const", const_load_queue[i][0], const_load_queue[i][1]))
-
-        # Phase 2: Allocate vector destinations
-        for hi in range(len(HASH_STAGES)):
-            c1_v = self.alloc_scratch(f"hash_c1_v_{hi}", VLEN)
-            c3_v = self.alloc_scratch(f"hash_c3_v_{hi}", VLEN)
-            hash_c1_vecs.append(c1_v)
-            hash_c3_vecs.append(c3_v)
-
-        for hi, mul_scalar in hash_mul_scalars:
-            if mul_scalar is not None:
-                mul_v = self.alloc_scratch(f"hash_mul_v_{hi}", VLEN)
-                hash_mul_vecs.append(mul_v)
-            else:
-                hash_mul_vecs.append(None)
-
-        # Phase 3: Interleave vbroadcasts with block offset loads
-        # We have 12 vbroadcasts (6 c1 + 6 c3) and 3 mul broadcasts = 15 valu ops
-        # Plus 11 block offset const loads (base offsets + 8/16/24 constants)
-
-        # Strategy: pair const loads with vbroadcasts (2 loads + up to 6 valu per cycle)
-        broadcast_queue = []
-        for i in range(len(HASH_STAGES)):
-            broadcast_queue.append(("vbroadcast", hash_c1_vecs[i], hash_c1_scalars[i]))
-        for i in range(len(HASH_STAGES)):
-            broadcast_queue.append(("vbroadcast", hash_c3_vecs[i], hash_c3_broadcast_scalars[i]))
-        for hi in range(len(HASH_STAGES)):
-            if hash_mul_vecs[hi] is not None:
-                broadcast_queue.append(("vbroadcast", hash_mul_vecs[hi], hash_mul_scalars[hi][1]))
-
-        # Pack: 2 const loads + 6 vbroadcasts per cycle while we have both
-        bc_idx = 0
-        const_idx = 0
-        pending_offset_ops = []
-        loaded_base_addrs = set(early_loaded_base_addrs)
-        if offset_addrs[0] == zero_const:
-            loaded_base_addrs.add(offset_addrs[0])
-        enqueued_base_addrs = set()
-        loaded_const_addrs = set(early_loaded_const_addrs)
-        while bc_idx < len(broadcast_queue) or const_idx < len(offset_loads) or pending_offset_ops:
-            bundle = {}
-
-            # Add up to 6 vbroadcasts
-            valu_ops = []
-            while len(valu_ops) < 6 and bc_idx < len(broadcast_queue):
-                valu_ops.append(broadcast_queue[bc_idx])
-                bc_idx += 1
-            if valu_ops:
-                bundle["valu"] = valu_ops
-
-            # Add up to 2 const loads
-            load_ops = []
-            loaded_bases_this_cycle = []
-            loaded_consts_this_cycle = []
-            while len(load_ops) < 2 and const_idx < len(offset_loads):
-                addr, val = offset_loads[const_idx]
-                load_ops.append(("const", addr, val))
-                if addr in base_addr_set:
-                    loaded_bases_this_cycle.append(addr)
-                elif addr in const_addr_set:
-                    loaded_consts_this_cycle.append(addr)
-                const_idx += 1
-            if load_ops:
-                bundle["load"] = load_ops
-
-            # Add up to 12 ALU ops for derived offsets
-            alu_ops = []
-            while pending_offset_ops and len(alu_ops) < SLOT_LIMITS["alu"]:
-                alu_ops.append(pending_offset_ops.pop(0))
-            if alu_ops:
-                bundle["alu"] = alu_ops
-
-            if bundle:
-                self.add_bundle(bundle)
-
-            loaded_base_addrs.update(loaded_bases_this_cycle)
-            loaded_const_addrs.update(loaded_consts_this_cycle)
-            constants_ready = len(loaded_const_addrs) == len(const_addr_set)
-            if constants_ready:
-                for base_addr in loaded_base_addrs:
-                    if base_addr in enqueued_base_addrs:
-                        continue
-                    t1, t2, t3 = base_targets[base_addr]
-                    pending_offset_ops.extend([
-                        ("+", t1, base_addr, eight_const),
-                        ("+", t2, base_addr, sixteen_const),
-                        ("+", t3, base_addr, twentyfour_const),
-                    ])
-                    enqueued_base_addrs.add(base_addr)
-
-        body_instrs = []
-
-        stage_buffers = []
-        vec_batch_size = (batch_size // VLEN) * VLEN
-        vec_block_count = vec_batch_size // VLEN
-        pipeline_buffers = min(13, vec_block_count) if vec_block_count else 0  # optimized from 10
-        for bi in range(pipeline_buffers):
-            stage_buffers.append({
-                "idx": self.alloc_scratch(f"idx_v{bi}", VLEN),
-                "val": self.alloc_scratch(f"val_v{bi}", VLEN),
-                "node": self.alloc_scratch(f"node_val_v{bi}", VLEN),
-                "addr": self.alloc_scratch(f"addr_v{bi}", VLEN),
-                "tmp1": self.alloc_scratch(f"tmp1_v{bi}", VLEN),
-                "tmp2": self.alloc_scratch(f"tmp2_v{bi}", VLEN),
-                "cond": self.alloc_scratch(f"cond_v{bi}", VLEN),
-                "idx_addr": self.alloc_scratch(f"idx_addr{bi}"),
-                "val_addr": self.alloc_scratch(f"val_addr{bi}"),
-            })
-
-        tmp_idx = self.alloc_scratch("tmp_idx")
-        tmp_val = self.alloc_scratch("tmp_val")
-        tmp_node_val = self.alloc_scratch("tmp_node_val")
-        tmp_addr = self.alloc_scratch("tmp_addr")
-
-        def schedule_vector_pipeline():
-            if vec_block_count == 0:
-                return []
-            instrs = []
-            active_blocks = []
-            free_buffers = list(range(pipeline_buffers))
-            next_block_index = 0
-
-            def start_next_block():
-                nonlocal next_block_index
-                if next_block_index >= vec_block_count or not free_buffers:
-                    return False
-                buf_idx = free_buffers.pop(0)
-                active_blocks.append({
-                    "block": next_block_index,
-                    "buf_idx": buf_idx,
-                    "buf": stage_buffers[buf_idx],
-                    "offset": offset_addrs[next_block_index],
-                    "phase": "init_addr",
-                    "round": 0,
-                    "stage": 0,
-                    "gather": 0,
-                })
-                next_block_index += 1
-                return True
-
-            while free_buffers and next_block_index < vec_block_count:
-                start_next_block()
-
-            while active_blocks or next_block_index < vec_block_count:
-                while free_buffers and next_block_index < vec_block_count:
-                    start_next_block()
-
-                alu_ops = []
-                load_ops = []
-                valu_ops = []
-                store_ops = []
-                flow_ops = []
-
-                alu_slots = SLOT_LIMITS["alu"]
-                load_slots = SLOT_LIMITS["load"]
-                valu_slots = SLOT_LIMITS["valu"]
-                store_slots = SLOT_LIMITS["store"]
-                flow_slots = SLOT_LIMITS["flow"]
-
-                scheduled_this_cycle = set()
-
-                # Wrap threshold: only need bounds check after round 9 for n_nodes=2047
-                # Max idx after round r is 2^(r+2) - 2
-                # After round 9: 2046 < 2047 (no wrap), after round 10: 4094 > 2047 (wrap)
-                wrap_round = 10
-
-                def next_round_phase(current_round):
-                    """Determine next phase after completing a round."""
-                    next_r = current_round + 1
-                    if next_r >= rounds:
-                        return "store_both"
-
-                    # Calculate effective depth
-                    # For rounds 0-wrap_round, depth = next_r
-                    # For rounds after wrap (11+), depth restarts from 0
-                    # After wrap at round 10, indices reset to 0, so:
-                    #   round 11 = depth 0, round 12 = depth 1, etc.
-                    if next_r <= wrap_round:
-                        depth = next_r
-                    else:
-                        # After wrap: round 11 = depth 0, round 12 = depth 1, etc.
-                        depth = next_r - wrap_round - 1
-
-                    # Use selection for depths 0-2 (both before and after wrap).
-                    # Depth 3+ selection adds too much VALU - use gather instead.
-
-                    if depth == 0:
-                        # Round 0 never hits this (special-cased in vload)
-                        # But round 11 (after wrap) does
-                        return "round0_xor"
-                    elif depth == 1:
-                        return "round1_select"
-                    elif depth == 2:
-                        return "round2_select1"
-                    else:
-                        return "addr"  # Gather for depth >= 3
-
-                # Priority 1: Flow operations (vselect for bounds) - only for rounds >= wrap_round
-                update4_blocks = [b for b in active_blocks if b["phase"] == "update4" and b["block"] not in scheduled_this_cycle]
-                update4_blocks.sort(key=lambda b: b["round"], reverse=True)
-                for block in update4_blocks:
-                    if flow_slots == 0:
-                        break
-                    buf = block["buf"]
-                    flow_ops.append(("vselect", buf["idx"], buf["cond"], buf["idx"], zero_v))
-                    block["round"] += 1
-                    block["stage"] = 0
-                    block["gather"] = 0
-                    block["next_phase"] = next_round_phase(block["round"] - 1)
-                    scheduled_this_cycle.add(block["block"])
-                    flow_slots -= 1
-
-                # Priority 2: Stores (2 per cycle)
-                for block in active_blocks:
-                    if store_slots == 0:
-                        break
-                    if block["phase"] == "store_both" and block["block"] not in scheduled_this_cycle:
-                        buf = block["buf"]
-                        store_ops.append(("vstore", buf["val_addr"], buf["val"]))
-                        block["next_phase"] = "store_idx"
-                        scheduled_this_cycle.add(block["block"])
-                        store_slots -= 1
-
-                for block in active_blocks:
-                    if store_slots == 0:
-                        break
-                    if block["phase"] == "store_idx" and block["block"] not in scheduled_this_cycle:
-                        buf = block["buf"]
-                        store_ops.append(("vstore", buf["idx_addr"], buf["idx"]))
-                        block["next_phase"] = "done"
-                        scheduled_this_cycle.add(block["block"])
-                        store_slots -= 1
-
-                # Priority 3: Vloads (need 2 load slots)
-                for block in active_blocks:
-                    if load_slots < 2:
-                        break
-                    if block["phase"] == "vload" and block["block"] not in scheduled_this_cycle:
-                        buf = block["buf"]
-                        load_ops.append(("vload", buf["idx"], buf["idx_addr"]))
-                        load_ops.append(("vload", buf["val"], buf["val_addr"]))
-                        # For round 0, skip addr and gather phases (all idx=0, use root_vec)
-                        if block["round"] == 0:
-                            block["next_phase"] = "round0_xor"
-                        else:
-                            block["next_phase"] = "addr"
-                        scheduled_this_cycle.add(block["block"])
-                        load_slots -= 2
-
-                # Priority 4: Gather loads (fill remaining load slots from multiple blocks)
-                # Skip gather for round 0 - use root_vec directly
-                for block in active_blocks:
-                    if load_slots == 0:
-                        break
-                    if block["phase"] == "gather":
-                        if block["round"] == 0:
-                            # Round 0: all idx=0, use preloaded tree[0]
-                            buf = block["buf"]
-                            # Copy root_vec to node (this is a valu op, handled below)
-                            block["next_phase"] = "round0_xor"
-                            scheduled_this_cycle.add(block["block"])
-                        else:
-                            buf = block["buf"]
-                            while load_slots > 0 and block["gather"] < VLEN:
-                                lane = block["gather"]
-                                load_ops.append(("load_offset", buf["node"], buf["addr"], lane))
-                                block["gather"] += 1
-                                load_slots -= 1
-                            if block["gather"] >= VLEN:
-                                block["next_phase"] = "xor"
-                                scheduled_this_cycle.add(block["block"])
-
-                # Priority 5: VALU operations - unified scheduling to fill all 6 slots
-                # Build a list of all schedulable VALU tasks with their costs and priorities
-                valu_tasks = []
-                for block in active_blocks:
-                    if block["block"] in scheduled_this_cycle:
-                        continue
-                    phase = block["phase"]
-                    buf = block["buf"]
-                    # Priority 0 = highest (closer to completion)
-                    if phase == "update3":
-                        valu_tasks.append((0, 1, block, "update3"))
-                    elif phase == "update2":
-                        valu_tasks.append((1, 1, block, "update2"))
-                    elif phase == "update1":
-                        valu_tasks.append((2, 2, block, "update1"))
-                    elif phase == "hash_op2":
-                        valu_tasks.append((5, 1, block, "hash_op2"))
-                    elif phase == "hash_mul":
-                        valu_tasks.append((7, 1, block, "hash_mul"))
-                    elif phase == "hash_op1":
-                        valu_tasks.append((5, 1, block, "hash_op1"))
-                    elif phase == "xor":
-                        valu_tasks.append((7, 1, block, "xor"))
-                    elif phase == "round0_xor":
-                        valu_tasks.append((7, 1, block, "round0_xor"))
-                    elif phase == "round1_select":
-                        valu_tasks.append((7, 1, block, "round1_select"))  # optimized from 6 to 7
-                    elif phase == "round2_select1":
-                        valu_tasks.append((6, 1, block, "round2_select1"))  # offset, priority 6
-                    elif phase == "round2_select2":
-                        valu_tasks.append((4, 1, block, "round2_select2"))  # sel1, priority 4 (optimized)
-                    elif phase == "round2_select3":
-                        valu_tasks.append((6, 2, block, "round2_select3"))  # low, high, priority 6
-                    elif phase == "round2_select4":
-                        valu_tasks.append((6, 1, block, "round2_select4"))  # diff
-                    elif phase == "round2_select5":
-                        valu_tasks.append((6, 1, block, "round2_select5"))  # node
-                    elif phase == "addr":
-                        valu_tasks.append((5, 1, block, "addr"))
-
-                # Sort by priority (lower = higher priority)
-                valu_tasks.sort(key=lambda x: x[0])
-
-                # Schedule tasks greedily
-                for priority, cost, block, phase in valu_tasks:
-                    if block["block"] in scheduled_this_cycle:
-                        continue
-                    buf = block["buf"]
-
-                    if phase == "hash_op1":
-                        hi = block["stage"]
-                        op1 = HASH_STAGES[hi][0]
-                        op3 = HASH_STAGES[hi][3]
-                        # Prefer offloading op3 shift to scalar ALU (8 lanes) when slots allow.
-                        if alu_slots >= VLEN and valu_slots >= 1:
-                            valu_ops.append((op1, buf["tmp1"], buf["val"], hash_c1_vecs[hi]))
-                            for lane in range(VLEN):
-                                alu_ops.append((op3, buf["tmp2"] + lane, buf["val"] + lane, hash_c3_lane_scalars[hi]))
-                            alu_slots -= VLEN
-                            valu_slots -= 1
-                            block["next_phase"] = "hash_op2"
-                            scheduled_this_cycle.add(block["block"])
-                            continue
-                        if valu_slots >= 2:
-                            valu_ops.append((op1, buf["tmp1"], buf["val"], hash_c1_vecs[hi]))
-                            valu_ops.append((op3, buf["tmp2"], buf["val"], hash_c3_vecs[hi]))
-                            valu_slots -= 2
-                            block["next_phase"] = "hash_op2"
-                            scheduled_this_cycle.add(block["block"])
-                            continue
-                        continue
-
-                    if phase == "update1":
-                        # If ALU slots are available, offload the parity AND to scalar ALU.
-                        if alu_slots >= VLEN and valu_slots >= 1:
-                            for lane in range(VLEN):
-                                alu_ops.append(("&", buf["tmp1"] + lane, buf["val"] + lane, one_const))
-                            alu_slots -= VLEN
-                            valu_ops.append(("multiply_add", buf["idx"], buf["idx"], two_v, one_v))
-                            valu_slots -= 1
-                            block["next_phase"] = "update2"
-                            scheduled_this_cycle.add(block["block"])
-                            continue
-
-                    if valu_slots < cost:
-                        continue
-
-                    if phase == "update3":
-                        valu_ops.append(("<", buf["cond"], buf["idx"], n_nodes_v))
-                        block["next_phase"] = "update4"
-                    elif phase == "update2":
-                        valu_ops.append(("+", buf["idx"], buf["idx"], buf["tmp1"]))
-                        # Skip wrap check for rounds where idx can't exceed n_nodes:
-                        # - Rounds 0-9 (before wrap): idx grows but stays < n_nodes
-                        # - Rounds 11-15 (after wrap): idx reset to 0 and grows small
-                        # Only round 10 (wrap_round) needs the wrap check
-                        if block["round"] != wrap_round:
-                            block["round"] += 1
-                            block["stage"] = 0
-                            block["gather"] = 0
-                            block["next_phase"] = next_round_phase(block["round"] - 1)
-                        else:
-                            block["next_phase"] = "update3"
-                    elif phase == "update1":
-                        valu_ops.append(("&", buf["tmp1"], buf["val"], one_v))
-                        valu_ops.append(("multiply_add", buf["idx"], buf["idx"], two_v, one_v))
-                        block["next_phase"] = "update2"
-                    elif phase == "hash_op2":
-                        hi = block["stage"]
-                        op2 = HASH_STAGES[hi][2]
-                        valu_ops.append((op2, buf["val"], buf["tmp1"], buf["tmp2"]))
-                        if hi + 1 == len(HASH_STAGES):
-                            block["next_phase"] = "update1"
-                        else:
-                            block["stage"] = hi + 1
-                            block["next_phase"] = "hash_mul" if hash_mul_vecs[hi + 1] is not None else "hash_op1"
-                    elif phase == "hash_mul":
-                        hi = block["stage"]
-                        mul_v = hash_mul_vecs[hi]
-                        valu_ops.append(("multiply_add", buf["val"], buf["val"], mul_v, hash_c1_vecs[hi]))
-                        if hi + 1 == len(HASH_STAGES):
-                            block["next_phase"] = "update1"
-                        else:
-                            block["stage"] = hi + 1
-                            block["next_phase"] = "hash_mul" if hash_mul_vecs[hi + 1] is not None else "hash_op1"
-                    elif phase == "xor":
-                        valu_ops.append(("^", buf["val"], buf["val"], buf["node"]))
-                        block["next_phase"] = "hash_mul" if hash_mul_vecs[0] is not None else "hash_op1"
-                    elif phase == "round0_xor":
-                        # Round 0: XOR with preloaded tree[0] vector
-                        valu_ops.append(("^", buf["val"], buf["val"], root_vec))
-                        block["next_phase"] = "hash_mul" if hash_mul_vecs[0] is not None else "hash_op1"
-                    elif phase == "round1_select":
-                        # Round 1: idx in {1,2}. tmp1 already holds parity == idx - 1.
-                        # node = tree1 + tmp1 * (tree2 - tree1)
-                        valu_ops.append(("multiply_add", buf["node"], delta_lr_vec, buf["tmp1"], left_vec))
-                        block["next_phase"] = "xor"
-                    elif phase == "round2_select1":
-                        # Round 2: compute offset = idx - 3 into tmp2 (preserve tmp1 parity)
-                        # Then compute sel1 = offset >> 1 in next cycle
-                        valu_ops.append(("-", buf["tmp2"], buf["idx"], three_vec))
-                        block["next_phase"] = "round2_select2"
-                    elif phase == "round2_select2":
-                        # Compute sel1 = offset >> 1
-                        # Try to also do low/high computations if we have slots (they don't depend on cond yet)
-                        valu_ops.append((">>", buf["cond"], buf["tmp2"], one_v))  # sel1
-                        block["next_phase"] = "round2_select3"
-                    elif phase == "round2_select3":
-                        # Compute low/high; sel0 == parity in tmp1
-                        valu_ops.append(("multiply_add", buf["tmp2"], delta_3_4_vec, buf["tmp1"], node3_vec))  # low
-                        valu_ops.append(("multiply_add", buf["node"], delta_5_6_vec, buf["tmp1"], node5_vec))  # high
-                        block["next_phase"] = "round2_select4"
-                    elif phase == "round2_select4":
-                        # Compute diff = high - low, then final selection if we have 2 slots
-                        # node = node - tmp2, then node = node * cond + tmp2
-                        # These have RAW dependency (second reads node from first), so can't combine
-                        valu_ops.append(("-", buf["node"], buf["node"], buf["tmp2"]))
-                        block["next_phase"] = "round2_select5"
-                    elif phase == "round2_select5":
-                        # Final selection: node = low + sel1 * diff
-                        valu_ops.append(("multiply_add", buf["node"], buf["node"], buf["cond"], buf["tmp2"]))
-                        block["next_phase"] = "xor"
-                    elif phase == "addr":
-                        valu_ops.append(("+", buf["addr"], buf["idx"], forest_base_v))
-                        block["next_phase"] = "gather"
-
-                    scheduled_this_cycle.add(block["block"])
-                    valu_slots -= cost
-
-                # Priority 6: ALU for init_addr (2 slots each)
-                for block in active_blocks:
-                    if alu_slots < 2:
-                        break
-                    if block["phase"] == "init_addr" and block["block"] not in scheduled_this_cycle:
-                        buf = block["buf"]
-                        alu_ops.append(("+", buf["idx_addr"], self.scratch["inp_indices_p"], block["offset"]))
-                        alu_ops.append(("+", buf["val_addr"], self.scratch["inp_values_p"], block["offset"]))
-                        block["next_phase"] = "vload"
-                        scheduled_this_cycle.add(block["block"])
-                        alu_slots -= 2
-
-                if not (alu_ops or load_ops or valu_ops or store_ops or flow_ops):
-                    # Check if any block is in gather phase but wasn't fully scheduled
-                    stuck = False
-                    for block in active_blocks:
-                        if block["phase"] == "gather" and block["gather"] < VLEN:
-                            stuck = True
-                            break
-                    if not stuck:
-                        raise RuntimeError("scheduler made no progress")
-                    # Otherwise we need another cycle to continue gather
-                    continue
-
-                instr = {}
-                if alu_ops:
-                    instr["alu"] = alu_ops
-                if load_ops:
-                    instr["load"] = load_ops
-                if valu_ops:
-                    instr["valu"] = valu_ops
-                if store_ops:
-                    instr["store"] = store_ops
-                if flow_ops:
-                    instr["flow"] = flow_ops
-                instrs.append(instr)
-
-                # Apply state transitions
-                new_active = []
-                for block in active_blocks:
-                    next_phase = block.pop("next_phase", None)
-                    if next_phase:
-                        block["phase"] = next_phase
-                    if block["phase"] == "done":
-                        free_buffers.append(block["buf_idx"])
-                    else:
-                        new_active.append(block)
-                active_blocks = new_active
-
-            return instrs
-
-        body_instrs.extend(schedule_vector_pipeline())
-
-        for round_i in range(rounds):
-            for i in range(vec_batch_size, batch_size):
-                tail_slots = []
-                i_const = self.scratch_const(i)
-                tail_slots.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
-                tail_slots.append(("load", ("load", tmp_idx, tmp_addr)))
-                tail_slots.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
-                tail_slots.append(("load", ("load", tmp_val, tmp_addr)))
-                tail_slots.append(("alu", ("+", tmp_addr, self.scratch["forest_values_p"], tmp_idx)))
-                tail_slots.append(("load", ("load", tmp_node_val, tmp_addr)))
-                tail_slots.append(("alu", ("^", tmp_val, tmp_val, tmp_node_val)))
-                tail_slots.extend(self.build_hash(tmp_val, tmp1, tmp2, round_i, i))
-                tail_slots.append(("alu", ("%", tmp1, tmp_val, two_const)))
-                tail_slots.append(("alu", ("==", tmp1, tmp1, zero_const)))
-                tail_slots.append(("flow", ("select", tmp3, tmp1, one_const, two_const)))
-                tail_slots.append(("alu", ("*", tmp_idx, tmp_idx, two_const)))
-                tail_slots.append(("alu", ("+", tmp_idx, tmp_idx, tmp3)))
-                tail_slots.append(("alu", ("<", tmp1, tmp_idx, self.scratch["n_nodes"])))
-                tail_slots.append(("flow", ("select", tmp_idx, tmp1, tmp_idx, zero_const)))
-                tail_slots.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
-                tail_slots.append(("store", ("store", tmp_addr, tmp_idx)))
-                tail_slots.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
-                tail_slots.append(("store", ("store", tmp_addr, tmp_val)))
-                body_instrs.extend(self.build(tail_slots))
-
-        self.instrs.extend(body_instrs)
 BASELINE = 147734
 
 def do_kernel_test(
@@ -856,9 +421,9 @@ def do_kernel_test(
         trace=trace,
     )
     machine.prints = prints
+    machine.run()
     for ref_mem in reference_kernel2(mem, value_trace):
         pass
-    machine.run()
     inp_values_p = ref_mem[6]
     if prints:
         print(machine.mem[inp_values_p : inp_values_p + len(inp.values)])
@@ -866,13 +431,15 @@ def do_kernel_test(
     assert (
         machine.mem[inp_values_p : inp_values_p + len(inp.values)]
         == ref_mem[inp_values_p : inp_values_p + len(inp.values)]
-    ), "Incorrect result on final values"
+    ), "Incorrect output values"
     inp_indices_p = ref_mem[5]
     if prints:
         print(machine.mem[inp_indices_p : inp_indices_p + len(inp.indices)])
         print(ref_mem[inp_indices_p : inp_indices_p + len(inp.indices)])
-    # Updating these in memory isn't required, but you can enable this check for debugging
-    # assert machine.mem[inp_indices_p:inp_indices_p+len(inp.indices)] == ref_mem[inp_indices_p:inp_indices_p+len(inp.indices)]
+    assert (
+        machine.mem[inp_indices_p : inp_indices_p + len(inp.indices)]
+        == ref_mem[inp_indices_p : inp_indices_p + len(inp.indices)]
+    ), "Incorrect output indices"
 
     print("CYCLES: ", machine.cycle)
     print("Speedup over baseline: ", BASELINE / machine.cycle)
