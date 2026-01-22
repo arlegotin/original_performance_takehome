@@ -424,13 +424,14 @@ class KernelBuilder:
         hash_multipliers = []
         for stage_op1, c1, stage_op2, stage_op3, c3 in HASH_STAGES:
             hash_const1.append(self.get_vector(c1, setup_ops))
-            hash_const3.append(self.get_vector(c3, setup_ops))
             # Fuse stages where possible: val = val * (1 + 2^c3) + c1
             if stage_op1 == "+" and stage_op2 == "+" and stage_op3 == "<<":
                 multiplier = 1 + (1 << c3)
                 hash_multipliers.append(self.get_vector(multiplier, setup_ops))
+                hash_const3.append(None)
             else:
                 hash_multipliers.append(None)
+                hash_const3.append(self.get_vector(c3, setup_ops))
 
         # Working memory for addresses and values
         assert items % VLEN == 0
@@ -451,7 +452,10 @@ class KernelBuilder:
 
         # Emit packed initialization
         self.instrs.extend(pack_operations(setup_ops))
-        self.emit("flow", ("pause",))
+        if self.instrs and "flow" not in self.instrs[-1]:
+            self.instrs[-1].setdefault("flow", []).append(("pause",))
+        else:
+            self.emit("flow", ("pause",))
 
         # === LOAD INITIAL DATA ===
         body_ops = []
@@ -467,6 +471,7 @@ class KernelBuilder:
                 "result": self.reserve_vector(),
                 "temp1": self.reserve_vector(),
                 "temp2": self.reserve_vector(),
+                "temp3": self.reserve_vector(),
                 "child_right": self.reserve_vector(),
             })
 
@@ -503,13 +508,13 @@ class KernelBuilder:
                             else:
                                 # Three-operation sequence
                                 body_ops.append(("valu", (
-                                    op3, wb["temp2"], val_vec, hash_const3[stage_idx]
+                                    op1, wb["temp2"], val_vec, hash_const1[stage_idx]
                                 )))
                                 body_ops.append(("valu", (
-                                    op1, val_vec, val_vec, hash_const1[stage_idx]
+                                    op3, wb["temp3"], val_vec, hash_const3[stage_idx]
                                 )))
                                 body_ops.append(("valu", (
-                                    op2, val_vec, val_vec, wb["temp2"]
+                                    op2, val_vec, wb["temp2"], wb["temp3"]
                                 )))
 
                     def emit_index_update(depth):
@@ -563,7 +568,7 @@ class KernelBuilder:
                                 ))
                                 body_ops.append((
                                     "alu",
-                                    ("&", wb["temp1"] + lane, wb["temp1"] + lane, const_two)
+                                    ("&", wb["temp3"] + lane, wb["temp1"] + lane, const_two)
                                 ))
 
                             body_ops.append(("flow", (
@@ -571,12 +576,12 @@ class KernelBuilder:
                                 preloaded_nodes[4], preloaded_nodes[3]
                             )))
                             body_ops.append(("flow", (
-                                "vselect", wb["child_right"], wb["temp2"],
+                                "vselect", wb["temp1"], wb["temp2"],
                                 preloaded_nodes[6], preloaded_nodes[5]
                             )))
                             body_ops.append(("flow", (
-                                "vselect", wb["result"], wb["temp1"],
-                                wb["child_right"], wb["result"]
+                                "vselect", wb["result"], wb["temp3"],
+                                wb["temp1"], wb["result"]
                             )))
                             return wb["result"]
 
@@ -585,15 +590,15 @@ class KernelBuilder:
                             for lane in range(VLEN):
                                 body_ops.append((
                                     "alu",
-                                    ("-", wb["temp1"] + lane, addr_vec + lane, const_fourteen)
+                                    ("-", wb["child_right"] + lane, addr_vec + lane, const_fourteen)
                                 ))
                                 body_ops.append((
                                     "alu",
-                                    ("&", wb["temp2"] + lane, wb["temp1"] + lane, const_one)
+                                    ("&", wb["temp2"] + lane, wb["child_right"] + lane, const_one)
                                 ))
                                 body_ops.append((
                                     "alu",
-                                    ("&", wb["child_right"] + lane, wb["temp1"] + lane, const_two)
+                                    ("&", wb["temp3"] + lane, wb["child_right"] + lane, const_two)
                                 ))
 
                             # First pair selections
@@ -606,7 +611,7 @@ class KernelBuilder:
                                 preloaded_nodes[10], preloaded_nodes[9]
                             )))
                             body_ops.append(("flow", (
-                                "vselect", wb["temp1"], wb["child_right"],
+                                "vselect", wb["temp1"], wb["temp3"],
                                 wb["temp1"], wb["result"]
                             )))
 
@@ -620,7 +625,7 @@ class KernelBuilder:
                                 preloaded_nodes[14], preloaded_nodes[13]
                             )))
                             body_ops.append(("flow", (
-                                "vselect", wb["result"], wb["child_right"],
+                                "vselect", wb["result"], wb["temp3"],
                                 wb["temp2"], wb["result"]
                             )))
 
@@ -628,11 +633,7 @@ class KernelBuilder:
                             for lane in range(VLEN):
                                 body_ops.append((
                                     "alu",
-                                    ("-", wb["temp2"] + lane, addr_vec + lane, const_fourteen)
-                                ))
-                                body_ops.append((
-                                    "alu",
-                                    ("&", wb["temp2"] + lane, wb["temp2"] + lane, const_four)
+                                    ("&", wb["temp2"] + lane, wb["child_right"] + lane, const_four)
                                 ))
                             body_ops.append(("flow", (
                                 "vselect", wb["result"], wb["temp2"],
@@ -663,29 +664,29 @@ class KernelBuilder:
 
                         if depth == 2:
                             body_ops.append(("flow", (
-                                "vselect", wb["result"], wb["temp2"],
+                                "vselect", wb["temp1"], wb["temp2"],
                                 preloaded_nodes[9], preloaded_nodes[7]
                             )))
                             body_ops.append(("flow", (
-                                "vselect", wb["child_right"], wb["temp2"],
+                                "vselect", wb["result"], wb["temp2"],
                                 preloaded_nodes[13], preloaded_nodes[11]
                             )))
                             body_ops.append(("flow", (
-                                "vselect", wb["result"], wb["temp1"],
-                                wb["child_right"], wb["result"]
+                                "vselect", wb["result"], wb["temp3"],
+                                wb["result"], wb["temp1"]
                             )))
 
                             body_ops.append(("flow", (
-                                "vselect", wb["child_right"], wb["temp2"],
+                                "vselect", wb["temp1"], wb["temp2"],
                                 preloaded_nodes[10], preloaded_nodes[8]
                             )))
                             body_ops.append(("flow", (
-                                "vselect", wb["temp2"], wb["temp2"],
+                                "vselect", wb["child_right"], wb["temp2"],
                                 preloaded_nodes[14], preloaded_nodes[12]
                             )))
                             body_ops.append(("flow", (
-                                "vselect", wb["child_right"], wb["temp1"],
-                                wb["temp2"], wb["child_right"]
+                                "vselect", wb["child_right"], wb["temp3"],
+                                wb["child_right"], wb["temp1"]
                             )))
 
                     # Loop unrolling 2x with register renaming for child buffers.
@@ -744,7 +745,10 @@ class KernelBuilder:
 
         # Pack and emit all body operations
         self.instrs.extend(pack_operations(body_ops))
-        self.instrs.append({"flow": [("pause",)]})
+        if self.instrs and "flow" not in self.instrs[-1]:
+            self.instrs[-1].setdefault("flow", []).append(("pause",))
+        else:
+            self.instrs.append({"flow": [("pause",)]})
 
 
 BASELINE = 147734
