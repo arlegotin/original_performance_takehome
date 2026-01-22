@@ -1,6 +1,7 @@
-# The current result is 1264 cycles
+# The current result is 1260 cycles
 
-## Live updates 🔴
+## 🔴 Live updates
+- **1260** (22 Jan, 14:24 CET)
 - **1264** (22 Jan, 12:15 CET)
 - **1273** (22 Jan, 11:57 CET)
 - **1309** (22 Jan, 11:45 CET)

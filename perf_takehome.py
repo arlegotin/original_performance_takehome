@@ -91,7 +91,10 @@ def compute_dependencies(engine: str, operation: tuple):
     return reads, writes
 
 
-def pack_operations(ops_list):
+PACK_STRATEGY = "greedy"
+
+
+def pack_operations_greedy(ops_list):
     """
     Pack a flat list of (engine, op) tuples into VLIW bundles.
     Uses greedy scheduling respecting data dependencies.
@@ -139,6 +142,151 @@ def pack_operations(ops_list):
             addr_ready[addr] = cycle + 1
 
     return [b for b in bundles if b]
+
+
+def pack_operations_critical(ops_list):
+    """
+    Pack operations into VLIW bundles using critical-path list scheduling.
+    """
+    if not ops_list:
+        return []
+
+    n_ops = len(ops_list)
+    preds = [dict() for _ in range(n_ops)]
+    succs = [[] for _ in range(n_ops)]
+    last_write = {}
+    last_read = {}
+
+    for idx, (eng, op) in enumerate(ops_list):
+        reads, writes = compute_dependencies(eng, op)
+
+        for addr in reads:
+            if addr in last_write:
+                pred = last_write[addr]
+                latency = 1
+                prev = preds[idx].get(pred)
+                if prev is None or latency > prev:
+                    preds[idx][pred] = latency
+
+        for addr in writes:
+            if addr in last_write:
+                pred = last_write[addr]
+                latency = 1
+                prev = preds[idx].get(pred)
+                if prev is None or latency > prev:
+                    preds[idx][pred] = latency
+            if addr in last_read:
+                pred = last_read[addr]
+                latency = 0
+                prev = preds[idx].get(pred)
+                if prev is None or latency > prev:
+                    preds[idx][pred] = latency
+
+        for addr in reads:
+            last_read[addr] = idx
+        for addr in writes:
+            last_write[addr] = idx
+
+    for idx in range(n_ops):
+        for pred, latency in preds[idx].items():
+            succs[pred].append((idx, latency))
+
+    pred_counts = [len(preds[idx]) for idx in range(n_ops)]
+    ready = {idx for idx, count in enumerate(pred_counts) if count == 0}
+
+    # Topological order for critical path length.
+    topo = []
+    queue = [idx for idx, count in enumerate(pred_counts) if count == 0]
+    while queue:
+        idx = queue.pop()
+        topo.append(idx)
+        for succ, _ in succs[idx]:
+            pred_counts[succ] -= 1
+            if pred_counts[succ] == 0:
+                queue.append(succ)
+
+    if len(topo) != n_ops:
+        return pack_operations_greedy(ops_list)
+
+    crit_dist = [0] * n_ops
+    for idx in reversed(topo):
+        best = 0
+        for succ, latency in succs[idx]:
+            cand = latency + crit_dist[succ]
+            if cand > best:
+                best = cand
+        crit_dist[idx] = best
+
+    pred_counts = [len(preds[idx]) for idx in range(n_ops)]
+    earliest = [0] * n_ops
+    ready = {idx for idx, count in enumerate(pred_counts) if count == 0}
+
+    bundles = []
+    slot_usage = []
+
+    def get_or_create_bundle(cycle):
+        while len(bundles) <= cycle:
+            bundles.append({})
+            slot_usage.append(defaultdict(int))
+
+    remaining = n_ops
+    cycle = 0
+    while remaining > 0:
+        if not ready:
+            return pack_operations_greedy(ops_list)
+
+        get_or_create_bundle(cycle)
+        scheduled_any = False
+
+        for eng, limit in SLOT_LIMITS.items():
+            if slot_usage[cycle][eng] >= limit:
+                continue
+
+            for _ in range(limit - slot_usage[cycle][eng]):
+                best_idx = None
+                best_pri = None
+                for op_idx in ready:
+                    if ops_list[op_idx][0] != eng:
+                        continue
+                    if earliest[op_idx] > cycle:
+                        continue
+                    pri = (crit_dist[op_idx], -earliest[op_idx], -op_idx)
+                    if best_pri is None or pri > best_pri:
+                        best_pri = pri
+                        best_idx = op_idx
+
+                if best_idx is None:
+                    break
+
+                bundles[cycle].setdefault(eng, []).append(ops_list[best_idx][1])
+                slot_usage[cycle][eng] += 1
+                scheduled_any = True
+
+                ready.remove(best_idx)
+                remaining -= 1
+
+                for succ, latency in succs[best_idx]:
+                    pred_counts[succ] -= 1
+                    if earliest[succ] < cycle + latency:
+                        earliest[succ] = cycle + latency
+                    if pred_counts[succ] == 0:
+                        ready.add(succ)
+
+        if remaining == 0:
+            break
+
+        if not scheduled_any:
+            return pack_operations_greedy(ops_list)
+
+        cycle += 1
+
+    return [b for b in bundles if b]
+
+
+def pack_operations(ops_list):
+    if PACK_STRATEGY == "critical":
+        return pack_operations_critical(ops_list)
+    return pack_operations_greedy(ops_list)
 
 
 class KernelBuilder:
@@ -232,18 +380,19 @@ class KernelBuilder:
 
         # Common vector constants
         vec_zero = self.get_vector(0, setup_ops)
-        vec_one = self.get_vector(1, setup_ops)
         vec_two = self.get_vector(2, setup_ops)
         const_one = self.get_scalar(1, setup_ops)
+        const_two = self.get_scalar(2, setup_ops)
+        const_minus_six = self.get_scalar(-6, setup_ops)
 
         # Broadcast tree base pointer
         vec_tree_base = self.reserve_vector("vec_tree_base")
         setup_ops.append(("valu", ("vbroadcast", vec_tree_base, self.memory_map["ptr_tree"])))
 
         # Additional vector constants for selection logic
-        vec_three = self.get_vector(3, setup_ops)
-        vec_four = self.get_vector(4, setup_ops)
-        vec_seven = self.get_vector(7, setup_ops)
+        const_ten = self.get_scalar(10, setup_ops)
+        const_four = self.get_scalar(4, setup_ops)
+        const_fourteen = self.get_scalar(14, setup_ops)
 
         # Pre-load tree nodes 0-14 for levels 0-3 (avoid gathers)
         preloaded_nodes = []
@@ -265,6 +414,10 @@ class KernelBuilder:
             preloaded_nodes.append(vector_slot)
 
 
+
+
+
+
         # Hash stage constants (with fusion for compatible stages)
         hash_const1 = []
         hash_const3 = []
@@ -279,16 +432,22 @@ class KernelBuilder:
             else:
                 hash_multipliers.append(None)
 
-        # Working memory for indices and values
+        # Working memory for addresses and values
         assert items % VLEN == 0
         num_blocks = items // VLEN
-        working_idx = self.reserve("working_idx", items)
+        working_addr = self.reserve("working_addr", items)
         working_val = self.reserve("working_val", items)
 
         # Offset counter and VLEN constant
         offset_counter = self.reserve("offset_counter")
         setup_ops.append(("load", ("const", offset_counter, 0)))
         vlen_scalar = self.get_scalar(VLEN, setup_ops)
+
+        # Initialize working addresses to tree base (indices start at 0).
+        for blk in range(num_blocks):
+            setup_ops.append(("valu", (
+                "+", working_addr + blk * VLEN, vec_tree_base, vec_zero
+            )))
 
         # Emit packed initialization
         self.instrs.extend(pack_operations(setup_ops))
@@ -297,8 +456,6 @@ class KernelBuilder:
         # === LOAD INITIAL DATA ===
         body_ops = []
         for blk in range(num_blocks):
-            body_ops.append(("alu", ("+", addr_tmp, self.memory_map["ptr_idx"], offset_counter)))
-            body_ops.append(("load", ("vload", working_idx + blk * VLEN, addr_tmp)))
             body_ops.append(("alu", ("+", addr_tmp, self.memory_map["ptr_val"], offset_counter)))
             body_ops.append(("load", ("vload", working_val + blk * VLEN, addr_tmp)))
             body_ops.append(("alu", ("+", offset_counter, offset_counter, vlen_scalar)))
@@ -310,7 +467,6 @@ class KernelBuilder:
                 "result": self.reserve_vector(),
                 "temp1": self.reserve_vector(),
                 "temp2": self.reserve_vector(),
-                "temp3": self.reserve_vector(),
                 "child_right": self.reserve_vector(),
             })
 
@@ -325,13 +481,12 @@ class KernelBuilder:
                         break
 
                     wb = work_buffers[buf_idx]
-                    idx_vec = working_idx + blk * VLEN
+                    addr_vec = working_addr + blk * VLEN
                     val_vec = working_val + blk * VLEN
 
                     def do_xor(node_vec, use_vector):
                         if use_vector:
-                            body_ops.append(("valu", ("^", val_vec, val_vec, node_vec)))
-                            return
+                            use_vector = False
                         for lane in range(VLEN):
                             body_ops.append((
                                 "alu", ("^", val_vec + lane, val_vec + lane, node_vec + lane)
@@ -348,19 +503,19 @@ class KernelBuilder:
                             else:
                                 # Three-operation sequence
                                 body_ops.append(("valu", (
-                                    op1, wb["temp2"], val_vec, hash_const1[stage_idx]
+                                    op3, wb["temp2"], val_vec, hash_const3[stage_idx]
                                 )))
                                 body_ops.append(("valu", (
-                                    op3, wb["temp3"], val_vec, hash_const3[stage_idx]
+                                    op1, val_vec, val_vec, hash_const1[stage_idx]
                                 )))
                                 body_ops.append(("valu", (
-                                    op2, val_vec, wb["temp2"], wb["temp3"]
+                                    op2, val_vec, val_vec, wb["temp2"]
                                 )))
 
                     def emit_index_update(depth):
                         if depth == tree_depth:
                             # Wrap: reset index to 0
-                            body_ops.append(("valu", ("+", idx_vec, vec_zero, vec_zero)))
+                            body_ops.append(("valu", ("+", addr_vec, vec_tree_base, vec_zero)))
                             return None
                         for lane in range(VLEN):
                             body_ops.append((
@@ -369,10 +524,10 @@ class KernelBuilder:
                             ))
                             body_ops.append((
                                 "alu",
-                                ("+", wb["temp3"] + lane, wb["temp2"] + lane, const_one)
+                                ("+", wb["temp1"] + lane, wb["temp2"] + lane, const_minus_six)
                             ))
                         body_ops.append(("valu", (
-                            "multiply_add", idx_vec, idx_vec, vec_two, wb["temp3"]
+                            "multiply_add", addr_vec, addr_vec, vec_two, wb["temp1"]
                         )))
                         return wb["temp2"]
 
@@ -384,38 +539,62 @@ class KernelBuilder:
 
                         if depth == 1:
                             # Indices are 1 or 2 - binary selection
-                            body_ops.append(("valu", ("&", wb["temp1"], idx_vec, vec_one)))
+                            for lane in range(VLEN):
+                                body_ops.append((
+                                    "alu",
+                                    ("&", wb["temp1"] + lane, addr_vec + lane, const_one)
+                                ))
                             body_ops.append(("flow", (
                                 "vselect", wb["result"], wb["temp1"],
-                                preloaded_nodes[1], preloaded_nodes[2]
+                                preloaded_nodes[2], preloaded_nodes[1]
                             )))
                             return wb["result"]
 
                         if depth == 2:
                             # Indices 3-6: two-level selection
-                            body_ops.append(("valu", ("-", wb["temp1"], idx_vec, vec_three)))
-                            body_ops.append(("valu", ("&", wb["temp2"], wb["temp1"], vec_one)))
-                            body_ops.append(("valu", ("&", wb["temp3"], wb["temp1"], vec_two)))
+                            for lane in range(VLEN):
+                                body_ops.append((
+                                    "alu",
+                                    ("-", wb["temp1"] + lane, addr_vec + lane, const_ten)
+                                ))
+                                body_ops.append((
+                                    "alu",
+                                    ("&", wb["temp2"] + lane, wb["temp1"] + lane, const_one)
+                                ))
+                                body_ops.append((
+                                    "alu",
+                                    ("&", wb["temp1"] + lane, wb["temp1"] + lane, const_two)
+                                ))
 
                             body_ops.append(("flow", (
                                 "vselect", wb["result"], wb["temp2"],
                                 preloaded_nodes[4], preloaded_nodes[3]
                             )))
                             body_ops.append(("flow", (
-                                "vselect", wb["temp1"], wb["temp2"],
+                                "vselect", wb["child_right"], wb["temp2"],
                                 preloaded_nodes[6], preloaded_nodes[5]
                             )))
                             body_ops.append(("flow", (
-                                "vselect", wb["result"], wb["temp3"],
-                                wb["temp1"], wb["result"]
+                                "vselect", wb["result"], wb["temp1"],
+                                wb["child_right"], wb["result"]
                             )))
                             return wb["result"]
 
                         if depth == 3:
                             # Indices 7-14: three-level selection
-                            body_ops.append(("valu", ("-", wb["temp1"], idx_vec, vec_seven)))
-                            body_ops.append(("valu", ("&", wb["temp2"], wb["temp1"], vec_one)))
-                            body_ops.append(("valu", ("&", wb["temp3"], wb["temp1"], vec_two)))
+                            for lane in range(VLEN):
+                                body_ops.append((
+                                    "alu",
+                                    ("-", wb["temp1"] + lane, addr_vec + lane, const_fourteen)
+                                ))
+                                body_ops.append((
+                                    "alu",
+                                    ("&", wb["temp2"] + lane, wb["temp1"] + lane, const_one)
+                                ))
+                                body_ops.append((
+                                    "alu",
+                                    ("&", wb["child_right"] + lane, wb["temp1"] + lane, const_two)
+                                ))
 
                             # First pair selections
                             body_ops.append(("flow", (
@@ -427,7 +606,7 @@ class KernelBuilder:
                                 preloaded_nodes[10], preloaded_nodes[9]
                             )))
                             body_ops.append(("flow", (
-                                "vselect", wb["temp1"], wb["temp3"],
+                                "vselect", wb["temp1"], wb["child_right"],
                                 wb["temp1"], wb["result"]
                             )))
 
@@ -441,13 +620,20 @@ class KernelBuilder:
                                 preloaded_nodes[14], preloaded_nodes[13]
                             )))
                             body_ops.append(("flow", (
-                                "vselect", wb["result"], wb["temp3"],
+                                "vselect", wb["result"], wb["child_right"],
                                 wb["temp2"], wb["result"]
                             )))
 
                             # Final bit selection (bit 2)
-                            body_ops.append(("valu", ("-", wb["temp2"], idx_vec, vec_seven)))
-                            body_ops.append(("valu", ("&", wb["temp2"], wb["temp2"], vec_four)))
+                            for lane in range(VLEN):
+                                body_ops.append((
+                                    "alu",
+                                    ("-", wb["temp2"] + lane, addr_vec + lane, const_fourteen)
+                                ))
+                                body_ops.append((
+                                    "alu",
+                                    ("&", wb["temp2"] + lane, wb["temp2"] + lane, const_four)
+                                ))
                             body_ops.append(("flow", (
                                 "vselect", wb["result"], wb["temp2"],
                                 wb["result"], wb["temp1"]
@@ -457,13 +643,8 @@ class KernelBuilder:
                         # Deep levels: gather from memory
                         for lane in range(VLEN):
                             body_ops.append((
-                                "alu",
-                                ("+", wb["temp1"] + lane, vec_tree_base + lane, idx_vec + lane)
-                            ))
-                        for lane in range(VLEN):
-                            body_ops.append((
                                 "load",
-                                ("load", wb["result"] + lane, wb["temp1"] + lane)
+                                ("load", wb["result"] + lane, addr_vec + lane)
                             ))
                         return wb["result"]
 
@@ -472,39 +653,39 @@ class KernelBuilder:
                         if depth == 1:
                             body_ops.append(("flow", (
                                 "vselect", wb["result"], wb["temp1"],
-                                preloaded_nodes[3], preloaded_nodes[5]
+                                preloaded_nodes[5], preloaded_nodes[3]
                             )))
                             body_ops.append(("flow", (
                                 "vselect", wb["child_right"], wb["temp1"],
-                                preloaded_nodes[4], preloaded_nodes[6]
+                                preloaded_nodes[6], preloaded_nodes[4]
                             )))
                             return
 
                         if depth == 2:
                             body_ops.append(("flow", (
-                                "vselect", wb["temp1"], wb["temp2"],
+                                "vselect", wb["result"], wb["temp2"],
                                 preloaded_nodes[9], preloaded_nodes[7]
                             )))
                             body_ops.append(("flow", (
-                                "vselect", wb["result"], wb["temp2"],
+                                "vselect", wb["child_right"], wb["temp2"],
                                 preloaded_nodes[13], preloaded_nodes[11]
                             )))
                             body_ops.append(("flow", (
-                                "vselect", wb["result"], wb["temp3"],
-                                wb["result"], wb["temp1"]
+                                "vselect", wb["result"], wb["temp1"],
+                                wb["child_right"], wb["result"]
                             )))
 
                             body_ops.append(("flow", (
-                                "vselect", wb["temp1"], wb["temp2"],
+                                "vselect", wb["child_right"], wb["temp2"],
                                 preloaded_nodes[10], preloaded_nodes[8]
                             )))
                             body_ops.append(("flow", (
-                                "vselect", wb["child_right"], wb["temp2"],
+                                "vselect", wb["temp2"], wb["temp2"],
                                 preloaded_nodes[14], preloaded_nodes[12]
                             )))
                             body_ops.append(("flow", (
-                                "vselect", wb["child_right"], wb["temp3"],
-                                wb["child_right"], wb["temp1"]
+                                "vselect", wb["child_right"], wb["temp1"],
+                                wb["temp2"], wb["child_right"]
                             )))
 
                     # Loop unrolling 2x with register renaming for child buffers.
@@ -537,22 +718,25 @@ class KernelBuilder:
                         if not has_next:
                             continue
 
-                        depth = (rnd + 1) % (tree_depth + 1)
+                        next_depth = (rnd + 1) % (tree_depth + 1)
                         if spec_next:
                             node_vec = wb["result"]
                         else:
-                            node_vec = emit_node_lookup(depth)
+                            node_vec = emit_node_lookup(next_depth)
 
-                        do_xor(node_vec, depth in (0, 2))
+                        do_xor(node_vec, next_depth in (0, 2))
                         emit_hash()
-                        emit_index_update(depth)
+                        emit_index_update(next_depth)
 
         # === STORE RESULTS (values and indices) ===
         store_ops = []
         store_ops.append(("load", ("const", offset_counter, 0)))
         for blk in range(num_blocks):
+            store_ops.append(("valu", (
+                "-", working_addr + blk * VLEN, working_addr + blk * VLEN, vec_tree_base
+            )))
             store_ops.append(("alu", ("+", addr_tmp, self.memory_map["ptr_idx"], offset_counter)))
-            store_ops.append(("store", ("vstore", addr_tmp, working_idx + blk * VLEN)))
+            store_ops.append(("store", ("vstore", addr_tmp, working_addr + blk * VLEN)))
             store_ops.append(("alu", ("+", addr_tmp, self.memory_map["ptr_val"], offset_counter)))
             store_ops.append(("store", ("vstore", addr_tmp, working_val + blk * VLEN)))
             store_ops.append(("alu", ("+", offset_counter, offset_counter, vlen_scalar)))
