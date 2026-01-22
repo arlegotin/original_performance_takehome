@@ -358,7 +358,6 @@ class KernelBuilder:
         """
         # Temporary registers for address computation
         addr_tmp = self.reserve("addr_tmp")
-        addr_tmp2 = self.reserve("addr_tmp2")
 
         # Known memory layout base; derive pointers from inputs.
         TREE_BASE = 7
@@ -366,8 +365,7 @@ class KernelBuilder:
         VAL_BASE = IDX_BASE + items
 
         # Reserve space for header values (even though we hardcode them)
-        for name in ["hdr_rounds", "hdr_nodes", "hdr_batch", "hdr_depth",
-                     "ptr_tree", "ptr_idx", "ptr_val"]:
+        for name in ["ptr_tree", "ptr_idx", "ptr_val"]:
             self.reserve(name)
 
         # === INITIALIZATION PHASE ===
@@ -397,20 +395,19 @@ class KernelBuilder:
         # Pre-load tree nodes 0-14 for levels 0-3 (avoid gathers)
         preloaded_nodes = []
         NUM_PRELOAD = 15
-        nodes0_7 = self.reserve_vector("nodes0_7")
-        setup_ops.append(("load", ("vload", nodes0_7, self.memory_map["ptr_tree"])))
+        nodes_tmp = self.reserve_vector("nodes_tmp")
+        setup_ops.append(("load", ("vload", nodes_tmp, self.memory_map["ptr_tree"])))
         for i in range(8):
             vector_slot = self.reserve_vector(f"vec_tree_{i}")
-            setup_ops.append(("valu", ("vbroadcast", vector_slot, nodes0_7 + i)))
+            setup_ops.append(("valu", ("vbroadcast", vector_slot, nodes_tmp + i)))
             preloaded_nodes.append(vector_slot)
 
-        nodes8_15 = self.reserve_vector("nodes8_15")
         offset_8 = self.get_scalar(8, setup_ops)
         setup_ops.append(("alu", ("+", addr_tmp, self.memory_map["ptr_tree"], offset_8)))
-        setup_ops.append(("load", ("vload", nodes8_15, addr_tmp)))
+        setup_ops.append(("load", ("vload", nodes_tmp, addr_tmp)))
         for i in range(8, NUM_PRELOAD):
             vector_slot = self.reserve_vector(f"vec_tree_{i}")
-            setup_ops.append(("valu", ("vbroadcast", vector_slot, nodes8_15 + (i - 8))))
+            setup_ops.append(("valu", ("vbroadcast", vector_slot, nodes_tmp + (i - 8))))
             preloaded_nodes.append(vector_slot)
 
 
@@ -491,7 +488,8 @@ class KernelBuilder:
 
                     def do_xor(node_vec, use_vector):
                         if use_vector:
-                            use_vector = False
+                            body_ops.append(("valu", ("^", val_vec, val_vec, node_vec)))
+                            return
                         for lane in range(VLEN):
                             body_ops.append((
                                 "alu", ("^", val_vec + lane, val_vec + lane, node_vec + lane)
