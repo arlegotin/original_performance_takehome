@@ -96,31 +96,25 @@ class KernelBuilder:
         tmp1 = self.alloc_scratch("tmp1")
         tmp2 = self.alloc_scratch("tmp2")
         tmp3 = self.alloc_scratch("tmp3")
-        init_vars = [
-            "rounds", "n_nodes", "batch_size", "forest_height",
-            "forest_values_p", "inp_indices_p", "inp_values_p",
-        ]
+        init_vars = ["rounds", "n_nodes", "batch_size", "forest_height"]
         for v in init_vars:
             self.alloc_scratch(v, 1)
+        forest_values_p = self.alloc_scratch("forest_values_p")
+        inp_indices_p = self.alloc_scratch("inp_indices_p")
+        inp_values_p = self.alloc_scratch("inp_values_p")
         # OPTIMIZED: Use different temp addresses to pack parameter loads
-        # Pairs: (rounds,0), (n_nodes,1), (batch_size,2), (forest_height,3), (forest_values_p,4), (inp_indices_p,5), (inp_values_p,6)
-        tmp_addrs = [tmp1, tmp2, tmp1, tmp2, tmp1, tmp2, tmp1]  # Alternate between tmp1 and tmp2
+        # Pairs: (rounds,0), (n_nodes,1), (batch_size,2), (forest_height,3)
+        tmp_addrs = [tmp1, tmp2, tmp1, tmp2]  # Alternate between tmp1 and tmp2
         for i in range(0, len(init_vars), 2):
-            if i + 1 < len(init_vars):
-                # Pack 2 const loads
-                self.add_bundle({"load": [("const", tmp_addrs[i], i), ("const", tmp_addrs[i+1], i+1)]})
-                # Pack 2 memory loads
-                self.add_bundle({"load": [
-                    ("load", self.scratch[init_vars[i]], tmp_addrs[i]),
-                    ("load", self.scratch[init_vars[i+1]], tmp_addrs[i+1]),
-                ]})
-            else:
-                # Odd one out - defer and combine with const 0,1,2 loads below
-                odd_idx = i
-                odd_addr = tmp_addrs[i]
-                odd_var = init_vars[i]
+            # Pack 2 const loads
+            self.add_bundle({"load": [("const", tmp_addrs[i], i), ("const", tmp_addrs[i+1], i+1)]})
+            # Pack 2 memory loads
+            self.add_bundle({"load": [
+                ("load", self.scratch[init_vars[i]], tmp_addrs[i]),
+                ("load", self.scratch[init_vars[i+1]], tmp_addrs[i+1]),
+            ]})
 
-        # OPTIMIZED: Pack odd parameter with const 0,1,2 loads
+        # OPTIMIZED: Pack const 0,1,2 loads with forest pointer setup
         zero_const = self.alloc_scratch("zero_const")
         one_const = self.alloc_scratch("one_const")
         two_const = self.alloc_scratch("two_const")
@@ -128,14 +122,16 @@ class KernelBuilder:
         self.const_map[1] = one_const
         self.const_map[2] = two_const
         # Preload tree[0] for round 0 optimization
-        root_scalar = self.alloc_scratch("root_scalar")
+        nodes0_7 = self.alloc_scratch("nodes0_7", VLEN)
         root_vec = self.alloc_scratch("root_vec", VLEN)
-        # Combine: const for odd param + const 0
-        self.add_bundle({"load": [("const", odd_addr, odd_idx), ("const", zero_const, 0)]})
-        # Combine: load odd param + const 1
-        self.add_bundle({"load": [("load", self.scratch[odd_var], odd_addr), ("const", one_const, 1)]})
-        # Combine: const 2 + root_scalar load
-        self.add_bundle({"load": [("const", two_const, 2), ("load", root_scalar, self.scratch["forest_values_p"])]})
+        # Use fixed forest base (header size) to derive pointers
+        self.add_bundle({"load": [("const", forest_values_p, 7), ("const", zero_const, 0)]})
+        self.add_bundle({"load": [("const", one_const, 1), ("vload", nodes0_7, forest_values_p)]})
+        self.add_bundle({
+            "load": [("const", two_const, 2)],
+            "alu": [("+", inp_indices_p, forest_values_p, self.scratch["n_nodes"])],
+        })
+        self.add_bundle({"alu": [("+", inp_values_p, inp_indices_p, self.scratch["batch_size"])]})
 
         zero_v = self.alloc_scratch("zero_v", VLEN)
         one_v = self.alloc_scratch("one_v", VLEN)
@@ -207,7 +203,7 @@ class KernelBuilder:
             ("vbroadcast", two_v, two_const),
             ("vbroadcast", n_nodes_v, self.scratch["n_nodes"]),
             ("vbroadcast", forest_base_v, self.scratch["forest_values_p"]),
-            ("vbroadcast", root_vec, root_scalar),
+            ("vbroadcast", root_vec, nodes0_7 + 0),
         ]}
         early_load_ops = take_early_loads()
         if early_load_ops:
@@ -215,48 +211,19 @@ class KernelBuilder:
         self.add_bundle(vb_bundle)
 
         # Preload tree[1], tree[2] for round 1 optimization (idx in {1,2} after round 0)
-        left_scalar = self.alloc_scratch("left_scalar")
-        right_scalar = self.alloc_scratch("right_scalar")
         left_vec = self.alloc_scratch("left_vec", VLEN)
         right_vec = self.alloc_scratch("right_vec", VLEN)
         delta_lr_vec = self.alloc_scratch("delta_lr_vec", VLEN)  # tree2 - tree1
-        # OPTIMIZED: Allocate const 3-6 early so we can combine ALU ops with loads
         const_three = self.alloc_scratch("const_three")
-        const_four = self.alloc_scratch("const_four")
-        const_five = self.alloc_scratch("const_five")
-        const_six = self.alloc_scratch("const_six")
         self.const_map[3] = const_three
-        self.const_map[4] = const_four
-        self.const_map[5] = const_five
-        self.const_map[6] = const_six
-        # OPTIMIZED: Pack tree1/tree2 ALU with const 3,4 loads (saves 1 cycle)
-        self.add_bundle({
-            "alu": [
-                ("+", left_scalar, self.scratch["forest_values_p"], one_const),
-                ("+", right_scalar, self.scratch["forest_values_p"], two_const),
-            ],
-            "load": [("const", const_three, 3), ("const", const_four, 4)],
-        })
-        # OPTIMIZED: Pack tree1/tree2 loads together
-        self.add_bundle({"load": [
-            ("load", left_scalar, left_scalar),
-            ("load", right_scalar, right_scalar),
+        self.add_bundle({"load": [("const", const_three, 3)]})
+        self.add_bundle({"valu": [
+            ("vbroadcast", left_vec, nodes0_7 + 1),
+            ("vbroadcast", right_vec, nodes0_7 + 2),
         ]})
-        # OPTIMIZED: Pack const 5,6 loads with tree1/tree2 broadcasts
-        self.add_bundle({
-            "load": [("const", const_five, 5), ("const", const_six, 6)],
-            "valu": [
-                ("vbroadcast", left_vec, left_scalar),
-                ("vbroadcast", right_vec, right_scalar),
-            ],
-        })
 
         # Preload tree[3..6] for round 2 optimization (idx in {3,4,5,6} after round 1)
         three_vec = self.alloc_scratch("three_vec", VLEN)
-        node3_scalar = self.alloc_scratch("node3_scalar")
-        node4_scalar = self.alloc_scratch("node4_scalar")
-        node5_scalar = self.alloc_scratch("node5_scalar")
-        node6_scalar = self.alloc_scratch("node6_scalar")
         node3_vec = self.alloc_scratch("node3_vec", VLEN)
         node4_vec = self.alloc_scratch("node4_vec", VLEN)
         node5_vec = self.alloc_scratch("node5_vec", VLEN)
@@ -264,49 +231,26 @@ class KernelBuilder:
         delta_3_4_vec = self.alloc_scratch("delta_3_4_vec", VLEN)  # tree4 - tree3
         delta_5_6_vec = self.alloc_scratch("delta_5_6_vec", VLEN)  # tree6 - tree5
 
-        # OPTIMIZED: Pack diff_1_2/three_vec with tree3-6 ALU ops (saves 1 cycle)
-        tree_alu_bundle = {
-            "valu": [
-                ("-", delta_lr_vec, right_vec, left_vec),
-                ("vbroadcast", three_vec, const_three),
-            ],
-            "alu": [
-                ("+", node3_scalar, self.scratch["forest_values_p"], const_three),
-                ("+", node4_scalar, self.scratch["forest_values_p"], const_four),
-                ("+", node5_scalar, self.scratch["forest_values_p"], const_five),
-                ("+", node6_scalar, self.scratch["forest_values_p"], const_six),
-            ],
-        }
+        tree_init_bundle = {"valu": [
+            ("vbroadcast", three_vec, const_three),
+            ("vbroadcast", node3_vec, nodes0_7 + 3),
+            ("vbroadcast", node4_vec, nodes0_7 + 4),
+            ("vbroadcast", node5_vec, nodes0_7 + 5),
+            ("vbroadcast", node6_vec, nodes0_7 + 6),
+            ("-", delta_lr_vec, right_vec, left_vec),
+        ]}
         early_load_ops = take_early_loads()
         if early_load_ops:
-            tree_alu_bundle["load"] = early_load_ops
-        self.add_bundle(tree_alu_bundle)
-        # OPTIMIZED: Pack loads 2 per cycle
-        # OPTIMIZED: Overlap loads with broadcasts - load tree3,4, then load tree5,6 with broadcast tree3,4
-        self.add_bundle({"load": [
-            ("load", node3_scalar, node3_scalar),
-            ("load", node4_scalar, node4_scalar),
-        ]})
-        self.add_bundle({
-            "load": [
-                ("load", node5_scalar, node5_scalar),
-                ("load", node6_scalar, node6_scalar),
-            ],
-            "valu": [
-                ("vbroadcast", node3_vec, node3_scalar),
-                ("vbroadcast", node4_vec, node4_scalar),
-            ],
-        })
-        # Broadcast tree5,6 and compute diff_3_4 (all VALU)
-        tree56_bundle = {"valu": [
-            ("vbroadcast", node5_vec, node5_scalar),
-            ("vbroadcast", node6_vec, node6_scalar),
+            tree_init_bundle["load"] = early_load_ops
+        self.add_bundle(tree_init_bundle)
+
+        tree_delta_bundle = {"valu": [
             ("-", delta_3_4_vec, node4_vec, node3_vec),
         ]}
         early_load_ops = take_early_loads()
         if early_load_ops:
-            tree56_bundle["load"] = early_load_ops
-        self.add_bundle(tree56_bundle)
+            tree_delta_bundle["load"] = early_load_ops
+        self.add_bundle(tree_delta_bundle)
         # diff_5_6 will be deferred to combine with first hash const load below
         deferred_delta_5_6 = ("-", delta_5_6_vec, node6_vec, node5_vec)
 
