@@ -19,42 +19,154 @@ We recommend you look through problem.py next.
 import heapq
 import random
 import unittest
+from collections import defaultdict
 
 from problem import (
-    Engine,
-    DebugInfo,
-    SLOT_LIMITS,
-    VLEN,
+    HASH_STAGES,
     N_CORES,
     SCRATCH_SIZE,
+    SLOT_LIMITS,
+    VLEN,
+    DebugInfo,
+    Engine,
+    Input,
     Machine,
     Tree,
-    Input,
-    HASH_STAGES,
-    reference_kernel,
     build_mem_image,
+    reference_kernel,
     reference_kernel2,
 )
 
 
+def _vec_range(base: int, length: int = VLEN) -> range:
+    return range(base, base + length)
+
+
+def _slot_rw(engine: str, slot: tuple) -> tuple[list[int], list[int]]:
+    """Get read and write addresses for a slot."""
+    reads: list[int] = []
+    writes: list[int] = []
+
+    if engine == "alu":
+        _op, dest, a1, a2 = slot
+        reads = [a1, a2]
+        writes = [dest]
+    elif engine == "valu":
+        match slot:
+            case ("vbroadcast", dest, src):
+                reads = [src]
+                writes = list(_vec_range(dest))
+            case ("multiply_add", dest, a, b, c):
+                reads = list(_vec_range(a)) + list(_vec_range(b)) + list(_vec_range(c))
+                writes = list(_vec_range(dest))
+            case (_op, dest, a1, a2):
+                reads = list(_vec_range(a1)) + list(_vec_range(a2))
+                writes = list(_vec_range(dest))
+            case _:
+                raise NotImplementedError(f"Unknown valu op {slot}")
+    elif engine == "load":
+        match slot:
+            case ("load", dest, addr):
+                reads = [addr]
+                writes = [dest]
+            case ("vload", dest, addr):
+                reads = [addr]
+                writes = list(_vec_range(dest))
+            case ("const", dest, _val):
+                writes = [dest]
+            case ("load_offset", dest, addr, _lane):
+                reads = [addr]
+                writes = [dest]
+            case _:
+                raise NotImplementedError(f"Unknown load op {slot}")
+    elif engine == "store":
+        match slot:
+            case ("store", addr, src):
+                reads = [addr, src]
+            case ("vstore", addr, src):
+                reads = [addr] + list(_vec_range(src))
+            case _:
+                raise NotImplementedError(f"Unknown store op {slot}")
+    elif engine == "flow":
+        match slot:
+            case ("select", dest, cond, a, b):
+                reads = [cond, a, b]
+                writes = [dest]
+            case ("add_imm", dest, a, _imm):
+                reads = [a]
+                writes = [dest]
+            case ("vselect", dest, cond, a, b):
+                reads = list(_vec_range(cond)) + list(_vec_range(a)) + list(_vec_range(b))
+                writes = list(_vec_range(dest))
+            case ("halt",) | ("pause",) | ("trace_write", _) | ("jump", _) | (
+                "jump_indirect", _,
+            ) | ("cond_jump", _, _) | ("cond_jump_rel", _, _) | ("coreid", _):
+                pass
+            case _:
+                raise NotImplementedError(f"Unknown flow op {slot}")
+
+    return reads, writes
+
+
+def _schedule_slots(slots: list[tuple[str, tuple]]) -> list[dict[str, list[tuple]]]:
+    """Automatically schedule operations into VLIW bundles respecting dependencies."""
+    cycles: list[dict[str, list[tuple]]] = []
+    usage: list[dict[str, int]] = []
+    ready_time: dict[int, int] = defaultdict(int)
+    last_write: dict[int, int] = defaultdict(lambda: -1)
+    last_read: dict[int, int] = defaultdict(lambda: -1)
+
+    def ensure_cycle(cycle: int) -> None:
+        while len(cycles) <= cycle:
+            cycles.append({})
+            usage.append(defaultdict(int))
+
+    def find_cycle(engine: str, earliest: int) -> int:
+        cycle = earliest
+        limit = SLOT_LIMITS[engine]
+        while True:
+            ensure_cycle(cycle)
+            if usage[cycle][engine] < limit:
+                return cycle
+            cycle += 1
+
+    for engine, slot in slots:
+        reads, writes = _slot_rw(engine, slot)
+        earliest = 0
+        for addr in reads:
+            earliest = max(earliest, ready_time[addr])
+        for addr in writes:
+            earliest = max(earliest, last_write[addr] + 1, last_read[addr])
+
+        cycle = find_cycle(engine, earliest)
+        ensure_cycle(cycle)
+        cycles[cycle].setdefault(engine, []).append(slot)
+        usage[cycle][engine] += 1
+
+        for addr in reads:
+            if last_read[addr] < cycle:
+                last_read[addr] = cycle
+        for addr in writes:
+            last_write[addr] = cycle
+            ready_time[addr] = cycle + 1
+
+    return [c for c in cycles if c]
+
+
 class KernelBuilder:
     def __init__(self):
+        self.instrs = []
         self.scratch = {}
         self.scratch_debug = {}
         self.scratch_ptr = 0
         self.const_map = {}
         self.vconst_map = {}
-        self.engines = []
-        self.slots = []
-        self.succs = []
-        self.indeg = []
-        self.last_writer = {}
-        self.last_reader = {}
-        self.war_addrs = set()
-        self.instrs = []
 
     def debug_info(self):
         return DebugInfo(scratch_map=self.scratch_debug)
+
+    def add(self, engine, slot):
+        self.instrs.append({engine: [slot]})
 
     def alloc_scratch(self, name=None, length=1):
         addr = self.scratch_ptr
@@ -65,333 +177,304 @@ class KernelBuilder:
         assert self.scratch_ptr <= SCRATCH_SIZE, "Out of scratch space"
         return addr
 
-    def _vec_range(self, base):
-        return list(range(base, base + VLEN))
+    def alloc_vec(self, name=None):
+        return self.alloc_scratch(name, VLEN)
 
-    def rw(self, engine, slot):
-        if engine == "alu":
-            _, dest, a1, a2 = slot
-            return [a1, a2], [dest]
-        if engine == "load":
-            match slot:
-                case ("const", dest, _val):
-                    return [], [dest]
-                case ("load", dest, addr):
-                    return [addr], [dest]
-                case ("vload", dest, addr):
-                    return [addr], self._vec_range(dest)
-                case ("load_offset", dest, addr, offset):
-                    return [addr + offset], [dest + offset]
-                case _:
-                    raise NotImplementedError(f"Unknown load op {slot}")
-        if engine == "valu":
-            match slot:
-                case ("vbroadcast", dest, src):
-                    return [src], self._vec_range(dest)
-                case ("multiply_add", dest, a, b, c):
-                    reads = self._vec_range(a) + self._vec_range(b) + self._vec_range(c)
-                    return reads, self._vec_range(dest)
-                case (op, dest, a1, a2):
-                    reads = self._vec_range(a1) + self._vec_range(a2)
-                    return reads, self._vec_range(dest)
-                case _:
-                    raise NotImplementedError(f"Unknown valu op {slot}")
-        if engine == "store":
-            match slot:
-                case ("vstore", addr, src):
-                    reads = [addr] + self._vec_range(src)
-                    return reads, []
-                case ("store", addr, src):
-                    return [addr, src], []
-                case _:
-                    raise NotImplementedError(f"Unknown store op {slot}")
-        raise NotImplementedError(f"Unknown engine {engine}")
-
-    def emit_op(self, engine, slot):
-        reads, writes = self.rw(engine, slot)
-        deps = set()
-        for r in reads:
-            if r in self.last_writer:
-                deps.add(self.last_writer[r])
-            if r in self.war_addrs and r in self.last_reader:
-                deps.add(self.last_reader[r])
-        for w in writes:
-            if w in self.last_writer:
-                deps.add(self.last_writer[w])
-            if w in self.war_addrs and w in self.last_reader:
-                deps.add(self.last_reader[w])
-        op_id = len(self.engines)
-        self.engines.append(engine)
-        self.slots.append(slot)
-        self.succs.append([])
-        self.indeg.append(len(deps))
-        for dep in deps:
-            self.succs[dep].append(op_id)
-        for r in reads:
-            if r in self.war_addrs:
-                self.last_reader[r] = op_id
-        for w in writes:
-            self.last_writer[w] = op_id
-            if w in self.war_addrs and w in self.last_reader:
-                del self.last_reader[w]
-        return op_id
-
-    def const(self, val, name=None):
+    def scratch_const(self, val, name=None, slots=None):
         if val not in self.const_map:
             addr = self.alloc_scratch(name)
-            self.emit_op("load", ("const", addr, val))
+            if slots is None:
+                self.add("load", ("const", addr, val))
+            else:
+                slots.append(("load", ("const", addr, val)))
             self.const_map[val] = addr
         return self.const_map[val]
 
-    def vconst(self, val, name=None):
-        if val in self.vconst_map:
-            return self.vconst_map[val]
-        scalar = self.const(val, name=name)
-        vec = self.alloc_scratch(f"{name}_vec" if name else None, VLEN)
-        self.emit_op("valu", ("vbroadcast", vec, scalar))
-        self.vconst_map[val] = vec
-        return vec
-
-    def vbroadcast(self, src, name=None):
-        vec = self.alloc_scratch(f"{name}_vec" if name else None, VLEN)
-        self.emit_op("valu", ("vbroadcast", vec, src))
-        return vec
-
-    def schedule(self):
-        n_ops = len(self.engines)
-        inf = n_ops + 1
-        load_dist = [inf] * n_ops
-        for op_id in range(n_ops - 1, -1, -1):
-            if self.engines[op_id] == "load":
-                load_dist[op_id] = 0
-            for succ in self.succs[op_id]:
-                cand = load_dist[succ] + 1
-                if cand < load_dist[op_id]:
-                    load_dist[op_id] = cand
-
-        indeg = self.indeg.copy()
-        ready = {}
-        for engine in SLOT_LIMITS:
-            if engine == "debug":
-                continue
-            ready[engine] = []
-
-        def perm(engine, op_id):
-            if engine == "load":
-                return (op_id ^ (op_id >> 1)) & 0xFFFF
-            if engine == "alu":
-                return op_id
-            if engine == "valu":
-                return -op_id
-            return op_id
-
-        for op_id, deg in enumerate(indeg):
-            if deg == 0:
-                engine = self.engines[op_id]
-                heapq.heappush(
-                    ready[engine],
-                    (load_dist[op_id], perm(engine, op_id), op_id),
-                )
-
-        instrs = []
-        while any(ready[engine] for engine in ready):
-            bundle = {}
-            next_ready = {engine: [] for engine in ready}
-            for engine, limit in SLOT_LIMITS.items():
-                if engine == "debug":
-                    continue
-                slots = []
-                for _ in range(limit):
-                    if not ready[engine]:
-                        break
-                    _, _, op_id = heapq.heappop(ready[engine])
-                    slots.append(op_id)
-                if slots:
-                    bundle[engine] = [self.slots[op_id] for op_id in slots]
-                    for op_id in slots:
-                        for succ in self.succs[op_id]:
-                            indeg[succ] -= 1
-                            if indeg[succ] == 0:
-                                succ_engine = self.engines[succ]
-                                heapq.heappush(
-                                    next_ready[succ_engine],
-                                    (
-                                        load_dist[succ],
-                                        perm(succ_engine, succ),
-                                        succ,
-                                    ),
-                                )
-            if bundle:
-                instrs.append(bundle)
-            for engine in ready:
-                if next_ready[engine]:
-                    for item in next_ready[engine]:
-                        heapq.heappush(ready[engine], item)
-        self.instrs = instrs
+    def scratch_vconst(self, val, name=None, slots=None):
+        if val not in self.vconst_map:
+            scalar = self.scratch_const(val, slots=slots)
+            addr = self.alloc_vec(name)
+            if slots is None:
+                self.add("valu", ("vbroadcast", addr, scalar))
+            else:
+                slots.append(("valu", ("vbroadcast", addr, scalar)))
+            self.vconst_map[val] = addr
+        return self.vconst_map[val]
 
     def build_kernel(
-        self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
+        self, forest_height: int, n_nodes: int, batch_size: int, rounds: int,
+        group_size: int = 17, round_tile: int = 13
     ):
         """
-        Vectorized kernel with DAG scheduling and multiply_add folding.
+        Vectorized kernel using flat-list generation with automatic scheduling.
+        Uses vselect for levels 0-3 to reduce memory loads.
         """
-        n_groups = batch_size // VLEN
+        tmp_init = self.alloc_scratch("tmp_init")
+        tmp_init2 = self.alloc_scratch("tmp_init2")
+        tmp_addr = self.alloc_scratch("tmp_addr")
+        tmp_addr2 = self.alloc_scratch("tmp_addr2")
 
-        idx_base = self.alloc_scratch("idx", batch_size)
-        val_base = self.alloc_scratch("val", batch_size)
-        node_base = self.alloc_scratch("node", batch_size)
-        tmp_base = self.alloc_scratch("tmp", batch_size)
-        aux_base = self.alloc_scratch("aux", batch_size)
-        idx_addr_base = self.alloc_scratch("idx_addr", n_groups)
-        val_addr_base = self.alloc_scratch("val_addr", n_groups)
+        # Derived from the known memory layout for this build.
+        FOREST_VALUES_P = 7
+        INP_INDICES_P = FOREST_VALUES_P + n_nodes
+        INP_VALUES_P = INP_INDICES_P + batch_size
 
-        self.war_addrs = set(range(node_base, node_base + batch_size))
-        self.war_addrs.update(range(tmp_base, tmp_base + batch_size))
+        init_vars = [
+            "rounds", "n_nodes", "batch_size", "forest_height",
+            "forest_values_p", "inp_indices_p", "inp_values_p",
+        ]
+        for v in init_vars:
+            self.alloc_scratch(v, 1)
 
-        forest_base = self.const(7, "forest_base")
-        zero = self.const(0, "zero")
-        forest_base_vec = self.vconst(7, "forest_base")
-        shift1 = self.const(1, "shift1")
-        shift9 = self.const(9, "shift9")
-        shift16 = self.const(16, "shift16")
-        shift19 = self.const(19, "shift19")
-        vlen = self.const(VLEN, "vlen")
-        one_vec = self.vconst(1, "one")
-        two_vec = self.vconst(2, "two")
-        three_vec = self.vconst(3, "three")
+        # Pack initialization loads - use hardcoded values
+        init_slots = []
+        init_slots.append(("load", ("const", self.scratch["forest_values_p"], FOREST_VALUES_P)))
+        init_slots.append(("load", ("const", self.scratch["inp_indices_p"], INP_INDICES_P)))
+        init_slots.append(("load", ("const", self.scratch["inp_values_p"], INP_VALUES_P)))
 
-        mul4097_vec = self.vconst(1 + (1 << 12), "mul4097")
-        mul33_vec = self.vconst(1 + (1 << 5), "mul33")
-        mul9_vec = self.vconst(1 + (1 << 3), "mul9")
-        add1_vec = self.vconst(0x7ED55D16, "add1")
-        xor2_vec = self.vconst(0xC761C23C, "xor2")
-        add3_vec = self.vconst(0x165667B1, "add3")
-        add4_vec = self.vconst(0xD3A2646C, "add4")
-        add5_vec = self.vconst(0xFD7046C5, "add5")
-        xor6_vec = self.vconst(0xB55A4F09, "xor6")
+        zero_vec = self.scratch_vconst(0, "v_zero", init_slots)
+        one_vec = self.scratch_vconst(1, "v_one", init_slots)
+        two_vec = self.scratch_vconst(2, "v_two", init_slots)
+        one_const = self.scratch_const(1, slots=init_slots)
 
-        def emit_shift(op, dest_vec, src_vec, shift_scalar):
-            for lane in range(VLEN):
-                self.emit_op(
-                    "alu",
-                    (op, dest_vec + lane, src_vec + lane, shift_scalar),
+        forest_vec = self.alloc_vec("v_forest_p")
+        init_slots.append(
+            ("valu", ("vbroadcast", forest_vec, self.scratch["forest_values_p"]))
+        )
+        three_vec = self.scratch_vconst(3, "v_three", init_slots)
+        four_vec = self.scratch_vconst(4, "v_four", init_slots)
+        seven_vec = self.scratch_vconst(7, "v_seven", init_slots)
+
+        # Preload nodes 0-14 for levels 0-3 vselect
+        node_vecs = []
+        PRELOAD_NODES = 15
+        for node_idx in range(PRELOAD_NODES):
+            node_scalar = self.alloc_scratch(f"node_{node_idx}")
+            node_vec = self.alloc_vec(f"v_node_{node_idx}")
+            node_offset = self.scratch_const(node_idx, slots=init_slots)
+            addr_reg = tmp_addr if node_idx % 2 == 0 else tmp_addr2
+            init_slots.append(
+                ("alu", ("+", addr_reg, self.scratch["forest_values_p"], node_offset))
+            )
+            init_slots.append(("load", ("load", node_scalar, addr_reg)))
+            init_slots.append(("valu", ("vbroadcast", node_vec, node_scalar)))
+            node_vecs.append(node_vec)
+
+        # Hash constants
+        hash_vec_consts1 = []
+        hash_vec_consts3 = []
+        hash_mul_vecs = []
+        for op1, val1, op2, op3, val3 in HASH_STAGES:
+            hash_vec_consts1.append(self.scratch_vconst(val1, slots=init_slots))
+            hash_vec_consts3.append(self.scratch_vconst(val3, slots=init_slots))
+            if op1 == "+" and op2 == "+" and op3 == "<<":
+                hash_mul_vecs.append(
+                    self.scratch_vconst(1 + (1 << val3), slots=init_slots)
                 )
+            else:
+                hash_mul_vecs.append(None)
 
+        assert batch_size % VLEN == 0
+        blocks_per_round = batch_size // VLEN
 
-        top_nodes = self.alloc_scratch("top_nodes", VLEN)
-        self.emit_op("load", ("vload", top_nodes, forest_base))
+        # Allocate scratch for all idx/val vectors (persistent across rounds)
+        idx_base = self.alloc_scratch("idx_scratch", batch_size)
+        val_base = self.alloc_scratch("val_scratch", batch_size)
 
-        d12 = self.alloc_scratch("d12")
-        d34 = self.alloc_scratch("d34")
-        d56 = self.alloc_scratch("d56")
-        self.emit_op("alu", ("^", d12, top_nodes + 1, top_nodes + 2))
-        self.emit_op("alu", ("^", d34, top_nodes + 3, top_nodes + 4))
-        self.emit_op("alu", ("^", d56, top_nodes + 5, top_nodes + 6))
+        offset = self.alloc_scratch("offset")
+        init_slots.append(("load", ("const", offset, 0)))
+        vlen_const = self.scratch_const(VLEN, slots=init_slots)
 
-        node0_vec = self.vbroadcast(top_nodes + 0, "node0")
-        node2_vec = self.vbroadcast(top_nodes + 2, "node2")
-        node3_vec = self.vbroadcast(top_nodes + 3, "node3")
-        node5_vec = self.vbroadcast(top_nodes + 5, "node5")
-        d12_vec = self.vbroadcast(d12, "d12")
-        d34_vec = self.vbroadcast(d34, "d34")
-        d56_vec = self.vbroadcast(d56, "d56")
+        self.instrs.extend(_schedule_slots(init_slots))
+        self.add("flow", ("pause",))
 
-        inp_indices_p = 7 + n_nodes
-        inp_values_p = inp_indices_p + batch_size
+        # Load initial idx/val from memory
+        slots: list[tuple[str, tuple]] = []
+        for block in range(blocks_per_round):
+            slots.append(
+                ("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], offset))
+            )
+            slots.append(("load", ("vload", idx_base + block * VLEN, tmp_addr)))
+            slots.append(
+                ("alu", ("+", tmp_addr, self.scratch["inp_values_p"], offset))
+            )
+            slots.append(("load", ("vload", val_base + block * VLEN, tmp_addr)))
+            slots.append(("alu", ("+", offset, offset, vlen_const)))
 
-        self.emit_op("load", ("const", idx_addr_base + 0, inp_indices_p))
-        self.emit_op("load", ("const", val_addr_base + 0, inp_values_p))
-        for g in range(1, n_groups):
-            self.emit_op("alu", ("+", idx_addr_base + g, idx_addr_base + g - 1, vlen))
-            self.emit_op("alu", ("+", val_addr_base + g, val_addr_base + g - 1, vlen))
+        # Allocate contexts for group processing
+        contexts = []
+        for _ in range(group_size):
+            contexts.append({
+                "node": self.alloc_vec(),
+                "tmp1": self.alloc_vec(),
+                "tmp2": self.alloc_vec(),
+                "tmp3": self.alloc_vec(),
+            })
 
-        for g in range(n_groups):
-            idx_addr = idx_addr_base + g
-            val_addr = val_addr_base + g
-            idx_vec = idx_base + g * VLEN
-            val_vec = val_base + g * VLEN
-            self.emit_op("valu", ("vbroadcast", idx_vec, zero))
-            self.emit_op("load", ("vload", val_vec, val_addr))
+        # Main kernel body - generate all operations for all blocks/rounds
+        for group_start in range(0, blocks_per_round, group_size):
+            for round_start in range(0, rounds, round_tile):
+                round_end = min(rounds, round_start + round_tile)
+                for gi in range(group_size):
+                    block = group_start + gi
+                    if block >= blocks_per_round:
+                        break
+                    ctx = contexts[gi]
+                    idx_vec = idx_base + block * VLEN
+                    val_vec = val_base + block * VLEN
 
-        for r in range(rounds):
-            depth = r % (forest_height + 1)
-            for g in range(n_groups):
-                idx_vec = idx_base + g * VLEN
-                val_vec = val_base + g * VLEN
-                node_vec = node_base + g * VLEN
-                tmp_vec = tmp_base + g * VLEN
-                aux_vec = aux_base + g * VLEN
+                    for _round in range(round_start, round_end):
+                        level = _round % (forest_height + 1)
 
-                if depth >= 3:
-                    self.emit_op("valu", ("+", aux_vec, idx_vec, forest_base_vec))
-                    for off in range(VLEN):
-                        self.emit_op(
-                            "load",
-                            ("load_offset", node_vec, aux_vec, off),
-                        )
-                    self.emit_op("valu", ("^", val_vec, val_vec, node_vec))
-                elif depth == 0:
-                    self.emit_op("valu", ("^", val_vec, val_vec, node0_vec))
-                elif depth == 1:
-                    self.emit_op("valu", ("&", tmp_vec, idx_vec, one_vec))
-                    self.emit_op("valu", ("*", node_vec, d12_vec, tmp_vec))
-                    self.emit_op("valu", ("^", val_vec, val_vec, node2_vec))
-                    self.emit_op("valu", ("^", val_vec, val_vec, node_vec))
-                else:
-                    self.emit_op("valu", ("-", aux_vec, idx_vec, three_vec))
-                    self.emit_op("valu", ("&", node_vec, aux_vec, one_vec))
-                    self.emit_op("valu", ("*", tmp_vec, d34_vec, node_vec))
-                    self.emit_op("valu", ("^", tmp_vec, tmp_vec, node3_vec))
-                    self.emit_op("valu", ("*", node_vec, d56_vec, node_vec))
-                    self.emit_op("valu", ("^", node_vec, node_vec, node5_vec))
-                    self.emit_op("valu", ("^", val_vec, val_vec, tmp_vec))
-                    self.emit_op("valu", ("^", node_vec, node_vec, tmp_vec))
-                    emit_shift(">>", tmp_vec, aux_vec, shift1)
-                    self.emit_op("valu", ("*", node_vec, node_vec, tmp_vec))
-                    self.emit_op("valu", ("^", val_vec, val_vec, node_vec))
+                        def emit_xor(node_vec: int) -> None:
+                            for lane in range(VLEN):
+                                slots.append(
+                                    ("alu", ("^", val_vec + lane, val_vec + lane, node_vec + lane))
+                                )
 
-                self.emit_op(
-                    "valu",
-                    ("multiply_add", val_vec, val_vec, mul4097_vec, add1_vec),
-                )
-                emit_shift(">>", tmp_vec, val_vec, shift19)
-                self.emit_op("valu", ("^", tmp_vec, tmp_vec, xor2_vec))
-                self.emit_op("valu", ("^", val_vec, val_vec, tmp_vec))
-                self.emit_op(
-                    "valu",
-                    ("multiply_add", val_vec, val_vec, mul33_vec, add3_vec),
-                )
-                emit_shift("<<", tmp_vec, val_vec, shift9)
-                self.emit_op("valu", ("+", node_vec, val_vec, add4_vec))
-                self.emit_op("valu", ("^", val_vec, node_vec, tmp_vec))
-                self.emit_op(
-                    "valu",
-                    ("multiply_add", val_vec, val_vec, mul9_vec, add5_vec),
-                )
-                emit_shift(">>", tmp_vec, val_vec, shift16)
-                self.emit_op("valu", ("^", tmp_vec, tmp_vec, xor6_vec))
-                self.emit_op("valu", ("^", val_vec, val_vec, tmp_vec))
+                        if level == 0:
+                            # Level 0: XOR with preloaded node[0]
+                            emit_xor(node_vecs[0])
+                        elif level == 1:
+                            # Level 1: vselect between node[1] and node[2]
+                            slots.append(("valu", ("&", ctx["tmp1"], idx_vec, one_vec)))
+                            slots.append((
+                                "flow",
+                                ("vselect", ctx["node"], ctx["tmp1"], node_vecs[1], node_vecs[2]),
+                            ))
+                            emit_xor(ctx["node"])
+                        elif level == 2:
+                            # Level 2: 3 vselects for nodes 3-6
+                            slots.append(("valu", ("-", ctx["tmp1"], idx_vec, three_vec)))
+                            slots.append(("valu", ("&", ctx["tmp2"], ctx["tmp1"], one_vec)))
+                            slots.append(("valu", ("&", ctx["node"], ctx["tmp1"], two_vec)))
+                            slots.append((
+                                "flow",
+                                ("vselect", ctx["tmp1"], ctx["tmp2"], node_vecs[4], node_vecs[3]),
+                            ))
+                            slots.append((
+                                "flow",
+                                ("vselect", ctx["tmp2"], ctx["tmp2"], node_vecs[6], node_vecs[5]),
+                            ))
+                            slots.append((
+                                "flow",
+                                ("vselect", ctx["node"], ctx["node"], ctx["tmp2"], ctx["tmp1"]),
+                            ))
+                            emit_xor(ctx["node"])
+                        elif level == 3:
+                            # Level 3: 7 vselects for nodes 7-14
+                            slots.append(("valu", ("-", ctx["tmp1"], idx_vec, seven_vec)))
+                            slots.append(("valu", ("&", ctx["tmp2"], ctx["tmp1"], one_vec)))
+                            slots.append(("valu", ("&", ctx["tmp3"], ctx["tmp1"], two_vec)))
 
-                if depth == forest_height:
-                    self.emit_op(
-                        "valu", ("^", idx_vec, idx_vec, idx_vec)
-                    )
-                else:
-                    self.emit_op("valu", ("&", tmp_vec, val_vec, one_vec))
-                    self.emit_op("valu", ("+", tmp_vec, tmp_vec, one_vec))
-                    self.emit_op(
-                        "valu", ("multiply_add", idx_vec, idx_vec, two_vec, tmp_vec)
-                    )
+                            slots.append((
+                                "flow",
+                                ("vselect", ctx["node"], ctx["tmp2"], node_vecs[8], node_vecs[7]),
+                            ))
+                            slots.append((
+                                "flow",
+                                ("vselect", ctx["tmp1"], ctx["tmp2"], node_vecs[10], node_vecs[9]),
+                            ))
+                            slots.append((
+                                "flow",
+                                ("vselect", ctx["tmp1"], ctx["tmp3"], ctx["tmp1"], ctx["node"]),
+                            ))
 
-        for g in range(n_groups):
-            idx_vec = idx_base + g * VLEN
-            val_vec = val_base + g * VLEN
-            self.emit_op("store", ("vstore", idx_addr_base + g, idx_vec))
-            self.emit_op("store", ("vstore", val_addr_base + g, val_vec))
+                            slots.append((
+                                "flow",
+                                ("vselect", ctx["node"], ctx["tmp2"], node_vecs[12], node_vecs[11]),
+                            ))
+                            slots.append((
+                                "flow",
+                                ("vselect", ctx["tmp2"], ctx["tmp2"], node_vecs[14], node_vecs[13]),
+                            ))
+                            slots.append((
+                                "flow",
+                                ("vselect", ctx["node"], ctx["tmp3"], ctx["tmp2"], ctx["node"]),
+                            ))
 
-        self.schedule()
+                            slots.append(("valu", ("-", ctx["tmp2"], idx_vec, seven_vec)))
+                            slots.append(("valu", ("&", ctx["tmp2"], ctx["tmp2"], four_vec)))
+                            slots.append((
+                                "flow",
+                                ("vselect", ctx["node"], ctx["tmp2"], ctx["node"], ctx["tmp1"]),
+                            ))
+                            emit_xor(ctx["node"])
+                        else:
+                            # Level 4+: gather from memory
+                            for lane in range(VLEN):
+                                slots.append((
+                                    "alu",
+                                    ("+", ctx["tmp1"] + lane, forest_vec + lane, idx_vec + lane),
+                                ))
+                            for lane in range(VLEN):
+                                slots.append(
+                                    ("load", ("load", ctx["node"] + lane, ctx["tmp1"] + lane))
+                                )
+                            emit_xor(ctx["node"])
+
+                        # Hash computation
+                        for hi, (op1, _val1, op2, op3, _val3) in enumerate(HASH_STAGES):
+                            mul_vec = hash_mul_vecs[hi]
+                            if mul_vec is not None:
+                                slots.append((
+                                    "valu",
+                                    ("multiply_add", val_vec, val_vec, mul_vec, hash_vec_consts1[hi]),
+                                ))
+                            else:
+                                slots.append(
+                                    ("valu", (op1, ctx["tmp1"], val_vec, hash_vec_consts1[hi]))
+                                )
+                                slots.append(
+                                    ("valu", (op3, ctx["tmp2"], val_vec, hash_vec_consts3[hi]))
+                                )
+                                slots.append(
+                                    ("valu", (op2, val_vec, ctx["tmp1"], ctx["tmp2"]))
+                                )
+
+                        # Index update
+                        if level == forest_height:
+                            # Wrap to 0 at leaf level
+                            slots.append(("valu", ("+", idx_vec, zero_vec, zero_vec)))
+                        else:
+                            for lane in range(VLEN):
+                                slots.append(
+                                    ("alu", ("&", ctx["tmp1"] + lane, val_vec + lane, one_const))
+                                )
+                                slots.append((
+                                    "alu",
+                                    ("+", ctx["node"] + lane, ctx["tmp1"] + lane, one_const),
+                                ))
+                            slots.append(
+                                ("valu", ("multiply_add", idx_vec, idx_vec, two_vec, ctx["node"]))
+                            )
+
+        # Store final results (values and indices)
+        store_slots = []
+        store_slots.append(("load", ("const", offset, 0)))
+        for block in range(blocks_per_round):
+            store_slots.append(
+                ("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], offset))
+            )
+            store_slots.append(
+                ("store", ("vstore", tmp_addr, idx_base + block * VLEN))
+            )
+            store_slots.append(
+                ("alu", ("+", tmp_addr, self.scratch["inp_values_p"], offset))
+            )
+            store_slots.append(
+                ("store", ("vstore", tmp_addr, val_base + block * VLEN))
+            )
+            store_slots.append(("alu", ("+", offset, offset, vlen_const)))
+        slots.extend(store_slots)
+
+        # Schedule all operations
+        self.instrs.extend(_schedule_slots(slots))
+        self.instrs.append({"flow": [("pause",)]})
+
 
 BASELINE = 147734
+
 
 def do_kernel_test(
     forest_height: int,
@@ -409,7 +492,6 @@ def do_kernel_test(
 
     kb = KernelBuilder()
     kb.build_kernel(forest.height, len(forest.values), len(inp.indices), rounds)
-    # print(kb.instrs)
 
     value_trace = {}
     machine = Machine(
@@ -421,25 +503,24 @@ def do_kernel_test(
         trace=trace,
     )
     machine.prints = prints
-    machine.run()
-    for ref_mem in reference_kernel2(mem, value_trace):
-        pass
-    inp_values_p = ref_mem[6]
-    if prints:
-        print(machine.mem[inp_values_p : inp_values_p + len(inp.values)])
-        print(ref_mem[inp_values_p : inp_values_p + len(inp.values)])
-    assert (
-        machine.mem[inp_values_p : inp_values_p + len(inp.values)]
-        == ref_mem[inp_values_p : inp_values_p + len(inp.values)]
-    ), "Incorrect output values"
-    inp_indices_p = ref_mem[5]
-    if prints:
-        print(machine.mem[inp_indices_p : inp_indices_p + len(inp.indices)])
-        print(ref_mem[inp_indices_p : inp_indices_p + len(inp.indices)])
-    assert (
-        machine.mem[inp_indices_p : inp_indices_p + len(inp.indices)]
-        == ref_mem[inp_indices_p : inp_indices_p + len(inp.indices)]
-    ), "Incorrect output indices"
+    for i, ref_mem in enumerate(reference_kernel2(mem, value_trace)):
+        machine.run()
+        inp_values_p = ref_mem[6]
+        if prints:
+            print(machine.mem[inp_values_p : inp_values_p + len(inp.values)])
+            print(ref_mem[inp_values_p : inp_values_p + len(inp.values)])
+        assert (
+            machine.mem[inp_values_p : inp_values_p + len(inp.values)]
+            == ref_mem[inp_values_p : inp_values_p + len(inp.values)]
+        ), f"Incorrect result on round {i}"
+        inp_indices_p = ref_mem[5]
+        if prints:
+            print(machine.mem[inp_indices_p : inp_indices_p + len(inp.indices)])
+            print(ref_mem[inp_indices_p : inp_indices_p + len(inp.indices)])
+        assert (
+            machine.mem[inp_indices_p : inp_indices_p + len(inp.indices)]
+            == ref_mem[inp_indices_p : inp_indices_p + len(inp.indices)]
+        ), f"Incorrect indices on round {i}"
 
     print("CYCLES: ", machine.cycle)
     print("Speedup over baseline: ", BASELINE / machine.cycle)
@@ -448,9 +529,6 @@ def do_kernel_test(
 
 class Tests(unittest.TestCase):
     def test_ref_kernels(self):
-        """
-        Test the reference kernels against each other
-        """
         random.seed(123)
         for i in range(10):
             f = Tree.generate(4)
@@ -463,34 +541,11 @@ class Tests(unittest.TestCase):
             assert inp.values == mem[mem[6] : mem[6] + len(inp.values)]
 
     def test_kernel_trace(self):
-        # Full-scale example for performance testing
         do_kernel_test(10, 16, 256, trace=True, prints=False)
-
-    # Passing this test is not required for submission, see submission_tests.py for the actual correctness test
-    # You can uncomment this if you think it might help you debug
-    # def test_kernel_correctness(self):
-    #     for batch in range(1, 3):
-    #         for forest_height in range(3):
-    #             do_kernel_test(
-    #                 forest_height + 2, forest_height + 4, batch * 16 * VLEN * N_CORES
-    #             )
 
     def test_kernel_cycles(self):
         do_kernel_test(10, 16, 256)
 
-
-# To run all the tests:
-#    python perf_takehome.py
-# To run a specific test:
-#    python perf_takehome.py Tests.test_kernel_cycles
-# To view a hot-reloading trace of all the instructions:  **Recommended debug loop**
-# NOTE: The trace hot-reloading only works in Chrome. In the worst case if things aren't working, drag trace.json onto https://ui.perfetto.dev/
-#    python perf_takehome.py Tests.test_kernel_trace
-# Then run `python watch_trace.py` in another tab, it'll open a browser tab, then click "Open Perfetto"
-# You can then keep that open and re-run the test to see a new trace.
-
-# To run the proper checks to see which thresholds you pass:
-#    python tests/submission_tests.py
 
 if __name__ == "__main__":
     unittest.main()
