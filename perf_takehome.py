@@ -92,7 +92,7 @@ def compute_dependencies(engine: str, operation: tuple):
 
 
 PACK_STRATEGY = "greedy"
-XOR_VALU_DEPTHS = {0, 4, 5}
+XOR_VALU_DEPTHS = {0, 2, 8}
 SCALAR_HASH_OP3_STAGES = set()
 SPEC_NEXT_DEPTHS = {0, 2}
 PRELOAD_DEPTHS = {0, 1, 2, 3}
@@ -356,7 +356,7 @@ class KernelBuilder:
             self.vector_cache[value] = vec_addr
         return self.vector_cache[value]
 
-    def build_kernel(self, tree_depth, _node_count, items, num_rounds, tile_blocks=21, tile_rounds=13):
+    def build_kernel(self, tree_depth, _node_count, items, num_rounds, tile_blocks=23, tile_rounds=13):
         """
         Generate the optimized kernel.
 
