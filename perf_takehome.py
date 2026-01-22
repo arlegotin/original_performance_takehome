@@ -248,15 +248,22 @@ class KernelBuilder:
         # Pre-load tree nodes 0-14 for levels 0-3 (avoid gathers)
         preloaded_nodes = []
         NUM_PRELOAD = 15
-        for i in range(NUM_PRELOAD):
-            scalar_slot = self.reserve(f"tree_node_{i}")
+        nodes0_7 = self.reserve_vector("nodes0_7")
+        setup_ops.append(("load", ("vload", nodes0_7, self.memory_map["ptr_tree"])))
+        for i in range(8):
             vector_slot = self.reserve_vector(f"vec_tree_{i}")
-            offset = self.get_scalar(i, setup_ops)
-            tmp = addr_tmp if i % 2 == 0 else addr_tmp2
-            setup_ops.append(("alu", ("+", tmp, self.memory_map["ptr_tree"], offset)))
-            setup_ops.append(("load", ("load", scalar_slot, tmp)))
-            setup_ops.append(("valu", ("vbroadcast", vector_slot, scalar_slot)))
+            setup_ops.append(("valu", ("vbroadcast", vector_slot, nodes0_7 + i)))
             preloaded_nodes.append(vector_slot)
+
+        nodes8_15 = self.reserve_vector("nodes8_15")
+        offset_8 = self.get_scalar(8, setup_ops)
+        setup_ops.append(("alu", ("+", addr_tmp, self.memory_map["ptr_tree"], offset_8)))
+        setup_ops.append(("load", ("vload", nodes8_15, addr_tmp)))
+        for i in range(8, NUM_PRELOAD):
+            vector_slot = self.reserve_vector(f"vec_tree_{i}")
+            setup_ops.append(("valu", ("vbroadcast", vector_slot, nodes8_15 + (i - 8))))
+            preloaded_nodes.append(vector_slot)
+
 
         # Hash stage constants (with fusion for compatible stages)
         hash_const1 = []
