@@ -92,12 +92,12 @@ def compute_dependencies(engine: str, operation: tuple):
 
 
 PACK_STRATEGY = "greedy"
-XOR_VALU_DEPTHS = {0, 4, 9}
+XOR_VALU_DEPTHS = {0, 3, 4, 5, 7}
 SCALAR_HASH_OP1_STAGES = set()
 SCALAR_HASH_OP2_STAGES = set()
 SCALAR_HASH_OP3_STAGES = set()
 SCALAR_OP1_STAGE = 1
-SCALAR_OP1_MIN_DEPTH = 9
+SCALAR_OP1_MIN_DEPTH = 6
 SCALAR_SHIFT_STAGE = None
 SCALAR_SHIFT_MIN_DEPTH = 6
 SPEC_NEXT_DEPTHS = {0, 2}
@@ -826,7 +826,8 @@ class KernelBuilder:
                         do_xor(node_vec, next_depth in XOR_VALU_DEPTHS)
                         emit_hash(next_depth)
                         emit_index_update(next_depth)
-# === STORE RESULTS (values and indices) ===
+
+        # === STORE RESULTS (values and indices) ===
         store_ops = []
         store_ops.append(("load", ("const", offset_counter, 0)))
         for blk in range(num_blocks):
