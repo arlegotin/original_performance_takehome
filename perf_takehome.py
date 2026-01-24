@@ -92,16 +92,17 @@ def compute_dependencies(engine: str, operation: tuple):
 
 
 PACK_STRATEGY = "greedy"
-XOR_VALU_DEPTHS = {3, 10}
+XOR_VALU_DEPTHS = {0, 4, 9}
 SCALAR_HASH_OP1_STAGES = set()
 SCALAR_HASH_OP2_STAGES = set()
 SCALAR_HASH_OP3_STAGES = set()
 SCALAR_OP1_STAGE = 1
-SCALAR_OP1_MIN_DEPTH = 10
+SCALAR_OP1_MIN_DEPTH = 9
 SCALAR_SHIFT_STAGE = None
 SCALAR_SHIFT_MIN_DEPTH = 6
 SPEC_NEXT_DEPTHS = {0, 2}
 PRELOAD_DEPTHS = {0, 1, 2, 3}
+UNROLL = 2
 
 
 def pack_operations_greedy(ops_list):
@@ -410,22 +411,37 @@ class KernelBuilder:
         const_fourteen = self.get_scalar(14, setup_ops)
         const_eighteen = self.get_scalar(18, setup_ops)
 
-        # Pre-load tree nodes 0-14 for levels 0-3 (avoid gathers)
+        # Pre-load tree nodes 0-(2^(d+1)-2) for configured depths.
         preloaded_nodes = []
-        NUM_PRELOAD = 15
-        nodes_tmp = self.reserve_vector("nodes_tmp")
-        setup_ops.append(("load", ("vload", nodes_tmp, self.memory_map["ptr_tree"])))
-        for i in range(8):
-            vector_slot = self.reserve_vector(f"vec_tree_{i}")
-            setup_ops.append(("valu", ("vbroadcast", vector_slot, nodes_tmp + i)))
-            preloaded_nodes.append(vector_slot)
-        offset_8 = self.get_scalar(8, setup_ops)
-        setup_ops.append(("alu", ("+", addr_tmp, self.memory_map["ptr_tree"], offset_8)))
-        setup_ops.append(("load", ("vload", nodes_tmp, addr_tmp)))
-        for i in range(8, NUM_PRELOAD):
-            vector_slot = self.reserve_vector(f"vec_tree_{i}")
-            setup_ops.append(("valu", ("vbroadcast", vector_slot, nodes_tmp + (i - 8))))
-            preloaded_nodes.append(vector_slot)
+        if PRELOAD_DEPTHS:
+            max_depth = max(PRELOAD_DEPTHS)
+            if max_depth >= 3:
+                num_preload = 15
+            elif max_depth >= 2:
+                num_preload = 7
+            elif max_depth >= 1:
+                num_preload = 3
+            else:
+                num_preload = 1
+        else:
+            num_preload = 0
+
+        if num_preload:
+            nodes_tmp = self.reserve_vector("nodes_tmp")
+            setup_ops.append(("load", ("vload", nodes_tmp, self.memory_map["ptr_tree"])))
+            first_block = min(8, num_preload)
+            for i in range(first_block):
+                vector_slot = self.reserve_vector(f"vec_tree_{i}")
+                setup_ops.append(("valu", ("vbroadcast", vector_slot, nodes_tmp + i)))
+                preloaded_nodes.append(vector_slot)
+            if num_preload > 8:
+                offset_8 = self.get_scalar(8, setup_ops)
+                setup_ops.append(("alu", ("+", addr_tmp, self.memory_map["ptr_tree"], offset_8)))
+                setup_ops.append(("load", ("vload", nodes_tmp, addr_tmp)))
+                for i in range(8, num_preload):
+                    vector_slot = self.reserve_vector(f"vec_tree_{i}")
+                    setup_ops.append(("valu", ("vbroadcast", vector_slot, nodes_tmp + (i - 8))))
+                    preloaded_nodes.append(vector_slot)
 
         # Hash stage constants (with fusion for compatible stages)
         hash_const1 = []
@@ -772,9 +788,9 @@ class KernelBuilder:
                             )))
 
                     # Loop unrolling 2x with register renaming for child buffers.
-                    for rnd in range(round_base, round_limit, 2):
+                    for rnd in range(round_base, round_limit, UNROLL):
                         depth = rnd % (tree_depth + 1)
-                        has_next = rnd + 1 < round_limit
+                        has_next = UNROLL > 1 and rnd + 1 < round_limit
                         spec_next = has_next and depth in SPEC_NEXT_DEPTHS and depth < tree_depth
 
                         node_vec = emit_node_lookup(depth)
