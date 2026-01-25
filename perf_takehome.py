@@ -238,7 +238,7 @@ class SlilScheduler:
 
 
 PACK_STRATEGY = "greedy"
-XOR_VALU_DEPTHS = {1, 3, 5}
+XOR_VALU_DEPTHS = {1, 3}
 SCALAR_HASH_OP1_STAGES = set()
 SCALAR_HASH_OP2_STAGES = set()
 SCALAR_HASH_OP3_STAGES = set()
@@ -256,8 +256,15 @@ ROUND_MAJOR = False
 INDEX_UPDATE_MODE = "alu"
 WAVEFRONT = False
 SHALLOW_PATH_BITS = True
-PATH_BITS_DEPTH = 3
+PATH_BITS_DEPTH = 4
 DEPTH12_XOR_SELECT = False
+SHALLOW_BIT_VALU = False
+OFFSET_ADD_FLOW = False
+INDEX_AND_VALU = False
+SEGMENT_BODY = False
+BLOCK_ORDER = "even_odd"
+HASH_OP3_FIRST = False
+CUSTOM_BLOCK_OFFSETS = None
 PAIR_STORES = True
 PRELOAD_DEPTHS = {0, 1, 2, 3, 4} if DEPTH4_PRELOAD else {0, 1, 2, 3}
 
@@ -806,7 +813,15 @@ class KernelBuilder:
         setup_ops.append(("valu", ("vbroadcast", vec_tree_base, self.memory_map["ptr_tree"])))
         vec_one = (
             self.get_vector(1, setup_ops)
-            if INDEX_UPDATE_MODE != "alu" or DEPTH12_XOR_SELECT
+            if INDEX_UPDATE_MODE != "alu"
+            or DEPTH12_XOR_SELECT
+            or SHALLOW_BIT_VALU
+            or INDEX_AND_VALU
+            else None
+        )
+        vec_four = (
+            self.get_vector(4, setup_ops)
+            if SHALLOW_BIT_VALU and SHALLOW_PATH_BITS and PATH_BITS_DEPTH > 3
             else None
         )
         vec_minus_six = self.get_vector(-6, setup_ops) if INDEX_UPDATE_MODE != "alu" else None
@@ -923,12 +938,19 @@ class KernelBuilder:
 
         # === LOAD INITIAL DATA ===
         body_ops = []
+        load_ops = []
+        compute_ops = []
+        main_ops = compute_ops if SEGMENT_BODY else body_ops
+        load_target = load_ops if SEGMENT_BODY else body_ops
         vlen_scalar = self.get_scalar(VLEN, setup_ops)
         vlen2_scalar = self.get_scalar(2 * VLEN, setup_ops) if PAIR_STORES else None
         for blk in range(num_blocks):
-            body_ops.append(("alu", ("+", addr_tmp, self.memory_map["ptr_val"], offset_counter)))
-            body_ops.append(("load", ("vload", working_val + blk * VLEN, addr_tmp)))
-            body_ops.append(("alu", ("+", offset_counter, offset_counter, vlen_scalar)))
+            load_target.append(("alu", ("+", addr_tmp, self.memory_map["ptr_val"], offset_counter)))
+            load_target.append(("load", ("vload", working_val + blk * VLEN, addr_tmp)))
+            if OFFSET_ADD_FLOW:
+                load_target.append(("flow", ("add_imm", offset_counter, offset_counter, VLEN)))
+            else:
+                load_target.append(("alu", ("+", offset_counter, offset_counter, vlen_scalar)))
 
         reuse_vec = nodes_tmp_reuse
 
@@ -958,15 +980,54 @@ class KernelBuilder:
             round_limit = min(num_rounds, round_base + tile_rounds)
 
             for group_base in range(0, num_blocks, tile_blocks):
-                for buf_idx in range(tile_blocks):
+                if BLOCK_ORDER == "even_odd":
+                    block_offsets = list(range(0, tile_blocks, 2)) + list(range(1, tile_blocks, 2))
+                elif BLOCK_ORDER == "custom" and CUSTOM_BLOCK_OFFSETS:
+                    seen = set()
+                    block_offsets = []
+                    for idx in CUSTOM_BLOCK_OFFSETS:
+                        if 0 <= idx < tile_blocks and idx not in seen:
+                            seen.add(idx)
+                            block_offsets.append(idx)
+                    for idx in range(tile_blocks):
+                        if idx not in seen:
+                            block_offsets.append(idx)
+                elif BLOCK_ORDER == "stride3":
+                    block_offsets = [i for s in range(3) for i in range(s, tile_blocks, 3)]
+                elif BLOCK_ORDER == "stride4":
+                    block_offsets = [i for s in range(4) for i in range(s, tile_blocks, 4)]
+                elif BLOCK_ORDER == "gray":
+                    block_offsets = sorted(range(tile_blocks), key=lambda i: i ^ (i >> 1))
+                elif BLOCK_ORDER == "bitrev":
+                    bits = (tile_blocks - 1).bit_length()
+                    def bitrev(i):
+                        r = 0
+                        for _ in range(bits):
+                            r = (r << 1) | (i & 1)
+                            i >>= 1
+                        return r
+                    block_offsets = sorted(range(tile_blocks), key=bitrev)
+                elif BLOCK_ORDER == "reverse":
+                    block_offsets = list(range(tile_blocks - 1, -1, -1))
+                elif BLOCK_ORDER == "swap_pairs":
+                    block_offsets = []
+                    for i in range(0, tile_blocks, 2):
+                        if i + 1 < tile_blocks:
+                            block_offsets.extend([i + 1, i])
+                        else:
+                            block_offsets.append(i)
+                else:
+                    block_offsets = range(tile_blocks)
+
+                for buf_idx in block_offsets:
                         blk = group_base + buf_idx
                         if blk >= num_blocks:
-                            break
+                            continue
 
                         wb = work_buffers[buf_idx]
                         addr_vec = working_addr + blk * VLEN
                         val_vec = working_val + blk * VLEN
-                        buf_ops = body_ops
+                        buf_ops = main_ops
 
                         def do_xor(node_vec, use_vector):
                             if use_vector:
@@ -989,18 +1050,32 @@ class KernelBuilder:
                                     # Three-operation sequence
                                     if stage_idx in scalar_hash_stages:
                                         for lane in range(VLEN):
-                                            buf_ops.append((
-                                                "alu",
-                                                (op1, wb["temp2"] + lane,
-                                                 val_vec + lane,
-                                                 hash_const1_scalar[stage_idx]),
-                                            ))
-                                            buf_ops.append((
-                                                "alu",
-                                                (op3, wb["temp3"] + lane,
-                                                 val_vec + lane,
-                                                 hash_const3_scalar[stage_idx]),
-                                            ))
+                                            if HASH_OP3_FIRST:
+                                                buf_ops.append((
+                                                    "alu",
+                                                    (op3, wb["temp3"] + lane,
+                                                     val_vec + lane,
+                                                     hash_const3_scalar[stage_idx]),
+                                                ))
+                                                buf_ops.append((
+                                                    "alu",
+                                                    (op1, wb["temp2"] + lane,
+                                                     val_vec + lane,
+                                                     hash_const1_scalar[stage_idx]),
+                                                ))
+                                            else:
+                                                buf_ops.append((
+                                                    "alu",
+                                                    (op1, wb["temp2"] + lane,
+                                                     val_vec + lane,
+                                                     hash_const1_scalar[stage_idx]),
+                                                ))
+                                                buf_ops.append((
+                                                    "alu",
+                                                    (op3, wb["temp3"] + lane,
+                                                     val_vec + lane,
+                                                     hash_const3_scalar[stage_idx]),
+                                                ))
                                             buf_ops.append((
                                                 "alu",
                                                 (op2, val_vec + lane,
@@ -1024,30 +1099,56 @@ class KernelBuilder:
                                                 and depth >= SCALAR_SHIFT_MIN_DEPTH
                                             )
                                         )
-                                        if use_scalar_op1:
-                                            for lane in range(VLEN):
-                                                buf_ops.append((
-                                                    "alu",
-                                                    (op1, wb["temp2"] + lane,
-                                                     val_vec + lane,
-                                                     hash_const1_scalar[stage_idx]),
-                                                ))
+                                        if HASH_OP3_FIRST:
+                                            if use_scalar_op3:
+                                                for lane in range(VLEN):
+                                                    buf_ops.append((
+                                                        "alu",
+                                                        (op3, wb["temp3"] + lane,
+                                                         val_vec + lane,
+                                                         hash_const3_scalar[stage_idx]),
+                                                    ))
+                                            else:
+                                                buf_ops.append(("valu", (
+                                                    op3, wb["temp3"], val_vec, hash_const3[stage_idx]
+                                                )))
+                                            if use_scalar_op1:
+                                                for lane in range(VLEN):
+                                                    buf_ops.append((
+                                                        "alu",
+                                                        (op1, wb["temp2"] + lane,
+                                                         val_vec + lane,
+                                                         hash_const1_scalar[stage_idx]),
+                                                    ))
+                                            else:
+                                                buf_ops.append(("valu", (
+                                                    op1, wb["temp2"], val_vec, hash_const1[stage_idx]
+                                                )))
                                         else:
-                                            buf_ops.append(("valu", (
-                                                op1, wb["temp2"], val_vec, hash_const1[stage_idx]
-                                            )))
-                                        if use_scalar_op3:
-                                            for lane in range(VLEN):
-                                                buf_ops.append((
-                                                    "alu",
-                                                    (op3, wb["temp3"] + lane,
-                                                     val_vec + lane,
-                                                     hash_const3_scalar[stage_idx]),
-                                                ))
-                                        else:
-                                            buf_ops.append(("valu", (
-                                                op3, wb["temp3"], val_vec, hash_const3[stage_idx]
-                                            )))
+                                            if use_scalar_op1:
+                                                for lane in range(VLEN):
+                                                    buf_ops.append((
+                                                        "alu",
+                                                        (op1, wb["temp2"] + lane,
+                                                         val_vec + lane,
+                                                         hash_const1_scalar[stage_idx]),
+                                                    ))
+                                            else:
+                                                buf_ops.append(("valu", (
+                                                    op1, wb["temp2"], val_vec, hash_const1[stage_idx]
+                                                )))
+                                            if use_scalar_op3:
+                                                for lane in range(VLEN):
+                                                    buf_ops.append((
+                                                        "alu",
+                                                        (op3, wb["temp3"] + lane,
+                                                         val_vec + lane,
+                                                         hash_const3_scalar[stage_idx]),
+                                                    ))
+                                            else:
+                                                buf_ops.append(("valu", (
+                                                    op3, wb["temp3"], val_vec, hash_const3[stage_idx]
+                                                )))
                                         if stage_idx in SCALAR_HASH_OP2_STAGES:
                                             for lane in range(VLEN):
                                                 buf_ops.append((
@@ -1070,11 +1171,14 @@ class KernelBuilder:
                                     buf_ops.append(("valu", ("+", addr_vec, vec_tree_base, vec_zero)))
                                 return None
                             if SHALLOW_PATH_BITS and depth < PATH_BITS_DEPTH:
-                                for lane in range(VLEN):
-                                    buf_ops.append((
-                                        "alu",
-                                        ("&", wb["temp2"] + lane, val_vec + lane, const_one)
-                                    ))
+                                if SHALLOW_BIT_VALU:
+                                    buf_ops.append(("valu", ("&", wb["temp2"], val_vec, vec_one)))
+                                else:
+                                    for lane in range(VLEN):
+                                        buf_ops.append((
+                                            "alu",
+                                            ("&", wb["temp2"] + lane, val_vec + lane, const_one)
+                                        ))
                                 buf_ops.append(("valu", (
                                     "multiply_add", addr_vec, addr_vec, vec_two, wb["temp2"]
                                 )))
@@ -1089,11 +1193,14 @@ class KernelBuilder:
                                 buf_ops.append(("valu", ("&", wb["temp2"], val_vec, vec_one)))
                                 buf_ops.append(("valu", ("+", wb["temp3"], wb["temp2"], vec_minus_six)))
                             else:
-                                for lane in range(VLEN):
-                                    buf_ops.append((
-                                        "alu",
-                                        ("&", wb["temp2"] + lane, val_vec + lane, const_one)
-                                    ))
+                                if INDEX_AND_VALU:
+                                    buf_ops.append(("valu", ("&", wb["temp2"], val_vec, vec_one)))
+                                else:
+                                    for lane in range(VLEN):
+                                        buf_ops.append((
+                                            "alu",
+                                            ("&", wb["temp2"] + lane, val_vec + lane, const_one)
+                                        ))
                                 for lane in range(VLEN):
                                     buf_ops.append((
                                         "alu",
@@ -1130,11 +1237,14 @@ class KernelBuilder:
                                         "^", wb["result"], preloaded_nodes[1], wb["temp3"]
                                     )))
                                 else:
-                                    for lane in range(VLEN):
-                                        buf_ops.append((
-                                            "alu",
-                                            ("&", wb["temp2"] + lane, addr_vec + lane, const_one)
-                                        ))
+                                    if SHALLOW_BIT_VALU:
+                                        buf_ops.append(("valu", ("&", wb["temp2"], addr_vec, vec_one)))
+                                    else:
+                                        for lane in range(VLEN):
+                                            buf_ops.append((
+                                                "alu",
+                                                ("&", wb["temp2"] + lane, addr_vec + lane, const_one)
+                                            ))
                                     buf_ops.append(("flow", (
                                         "vselect", wb["result"], wb["temp2"],
                                         preloaded_nodes[2], preloaded_nodes[1]
@@ -1190,15 +1300,19 @@ class KernelBuilder:
                                     )))
                                 else:
                                     if SHALLOW_PATH_BITS and depth < PATH_BITS_DEPTH:
-                                        for lane in range(VLEN):
-                                            buf_ops.append((
-                                                "alu",
-                                                ("&", wb["temp2"] + lane, addr_vec + lane, const_one)
-                                            ))
-                                            buf_ops.append((
-                                                "alu",
-                                                ("&", wb["temp3"] + lane, addr_vec + lane, const_two)
-                                            ))
+                                        if SHALLOW_BIT_VALU:
+                                            buf_ops.append(("valu", ("&", wb["temp2"], addr_vec, vec_one)))
+                                            buf_ops.append(("valu", ("&", wb["temp3"], addr_vec, vec_two)))
+                                        else:
+                                            for lane in range(VLEN):
+                                                buf_ops.append((
+                                                    "alu",
+                                                    ("&", wb["temp2"] + lane, addr_vec + lane, const_one)
+                                                ))
+                                                buf_ops.append((
+                                                    "alu",
+                                                    ("&", wb["temp3"] + lane, addr_vec + lane, const_two)
+                                                ))
                                     else:
                                         for lane in range(VLEN):
                                             buf_ops.append((
@@ -1231,15 +1345,19 @@ class KernelBuilder:
                             if depth == 3 and depth in PRELOAD_DEPTHS:
                                 # Indices 7-14: three-level selection
                                 if SHALLOW_PATH_BITS and depth < PATH_BITS_DEPTH:
-                                    for lane in range(VLEN):
-                                        buf_ops.append((
-                                            "alu",
-                                            ("&", wb["temp2"] + lane, addr_vec + lane, const_one)
-                                        ))
-                                        buf_ops.append((
-                                            "alu",
-                                            ("&", wb["temp3"] + lane, addr_vec + lane, const_two)
-                                        ))
+                                    if SHALLOW_BIT_VALU:
+                                        buf_ops.append(("valu", ("&", wb["temp2"], addr_vec, vec_one)))
+                                        buf_ops.append(("valu", ("&", wb["temp3"], addr_vec, vec_two)))
+                                    else:
+                                        for lane in range(VLEN):
+                                            buf_ops.append((
+                                                "alu",
+                                                ("&", wb["temp2"] + lane, addr_vec + lane, const_one)
+                                            ))
+                                            buf_ops.append((
+                                                "alu",
+                                                ("&", wb["temp3"] + lane, addr_vec + lane, const_two)
+                                            ))
                                 else:
                                     for lane in range(VLEN):
                                         buf_ops.append((
@@ -1285,11 +1403,14 @@ class KernelBuilder:
 
                                 # Final bit selection (bit 2)
                                 if SHALLOW_PATH_BITS and depth < PATH_BITS_DEPTH:
-                                    for lane in range(VLEN):
-                                        buf_ops.append((
-                                            "alu",
-                                            ("&", wb["temp2"] + lane, addr_vec + lane, const_four)
-                                        ))
+                                    if SHALLOW_BIT_VALU:
+                                        buf_ops.append(("valu", ("&", wb["temp2"], addr_vec, vec_four)))
+                                    else:
+                                        for lane in range(VLEN):
+                                            buf_ops.append((
+                                                "alu",
+                                                ("&", wb["temp2"] + lane, addr_vec + lane, const_four)
+                                            ))
                                     buf_ops.append(("flow", (
                                         "vselect", wb["result"], wb["temp2"],
                                         wb["child_right"], wb["result"]
@@ -1579,7 +1700,10 @@ class KernelBuilder:
                 store_ops.append(("flow", ("add_imm", addr_tmp2, addr_tmp, VLEN)))
                 store_ops.append(("store", ("vstore", addr_tmp, working_addr + blk * VLEN)))
                 store_ops.append(("store", ("vstore", addr_tmp2, working_addr + (blk + 1) * VLEN)))
-                store_ops.append(("alu", ("+", offset_counter, offset_counter, vlen2_scalar)))
+                if OFFSET_ADD_FLOW:
+                    store_ops.append(("flow", ("add_imm", offset_counter, offset_counter, 2 * VLEN)))
+                else:
+                    store_ops.append(("alu", ("+", offset_counter, offset_counter, vlen2_scalar)))
 
             if num_blocks % 2:
                 blk = num_blocks - 1
@@ -1588,7 +1712,10 @@ class KernelBuilder:
                 emit_index_adjust(blk)
                 store_ops.append(("alu", ("+", addr_tmp, self.memory_map["ptr_idx"], offset_counter)))
                 store_ops.append(("store", ("vstore", addr_tmp, working_addr + blk * VLEN)))
-                store_ops.append(("alu", ("+", offset_counter, offset_counter, vlen_scalar)))
+                if OFFSET_ADD_FLOW:
+                    store_ops.append(("flow", ("add_imm", offset_counter, offset_counter, VLEN)))
+                else:
+                    store_ops.append(("alu", ("+", offset_counter, offset_counter, vlen_scalar)))
         else:
             for blk in range(num_blocks):
                 store_ops.append(("alu", ("+", addr_tmp, self.memory_map["ptr_val"], offset_counter)))
@@ -1596,11 +1723,19 @@ class KernelBuilder:
                 emit_index_adjust(blk)
                 store_ops.append(("alu", ("+", addr_tmp, self.memory_map["ptr_idx"], offset_counter)))
                 store_ops.append(("store", ("vstore", addr_tmp, working_addr + blk * VLEN)))
-                store_ops.append(("alu", ("+", offset_counter, offset_counter, vlen_scalar)))
-        body_ops.extend(store_ops)
-
-        # Pack and emit all body operations
-        self.instrs.extend(pack_operations(body_ops))
+                if OFFSET_ADD_FLOW:
+                    store_ops.append(("flow", ("add_imm", offset_counter, offset_counter, VLEN)))
+                else:
+                    store_ops.append(("alu", ("+", offset_counter, offset_counter, vlen_scalar)))
+        if SEGMENT_BODY:
+            # Pack and emit segmented body operations.
+            self.instrs.extend(pack_operations(load_ops))
+            self.instrs.extend(pack_operations(compute_ops))
+            self.instrs.extend(pack_operations(store_ops))
+        else:
+            body_ops.extend(store_ops)
+            # Pack and emit all body operations
+            self.instrs.extend(pack_operations(body_ops))
         if self.instrs and "flow" not in self.instrs[-1]:
             self.instrs[-1].setdefault("flow", []).append(("pause",))
         else:
