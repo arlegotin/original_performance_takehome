@@ -181,6 +181,11 @@ class KernelBuilder:
             ops = flatten(segment)
             if not ops:
                 return []
+            if SCHED_SEED is None:
+                tie_break = list(range(len(ops)))
+            else:
+                rng = random.Random(SCHED_SEED)
+                tie_break = [rng.random() for _ in range(len(ops))]
             pause_token = -2
             has_start_pause = any(op["pause_role"] == "start" for op in ops)
             last_write = {}
@@ -229,6 +234,76 @@ class KernelBuilder:
                 if succs[i]:
                     heights[i] = 1 + max(heights[j] for j in succs[i])
 
+            if USE_SLIL_SCHED:
+                def schedule_segment_slil():
+                    pred_count = deps[:]
+                    ready = {i for i, d in enumerate(pred_count) if d == 0}
+                    last_use = {}
+                    for i in range(len(ops) - 1, -1, -1):
+                        for addr in ops[i]["reads"]:
+                            if addr not in last_use:
+                                last_use[addr] = i
+
+                    scheduled_instrs = []
+                    while ready:
+                        counts = {k: 0 for k in SLOT_LIMITS if k != "debug"}
+                        bundle = {}
+                        scheduled = []
+
+                        def slil_priority(idx):
+                            op = ops[idx]
+                            height_score = -heights[idx]
+                            last_use_score = 0
+                            for addr in op["reads"]:
+                                if last_use.get(addr) == idx:
+                                    last_use_score -= 1
+                            early_consumer_score = 0
+                            for s in succs[idx]:
+                                if heights[s] > 0:
+                                    early_consumer_score -= 1
+                            return (height_score, last_use_score, early_consumer_score, idx)
+
+                        ready_sorted = sorted(ready, key=slil_priority)
+                        engine_passes = ("valu", "load", "alu", "flow", "store", "debug")
+                        for engine in engine_passes:
+                            for idx in ready_sorted:
+                                if idx in scheduled:
+                                    continue
+                                if ops[idx]["engine"] != engine:
+                                    continue
+                                if counts[engine] >= SLOT_LIMITS[engine]:
+                                    continue
+                                bundle.setdefault(engine, []).append(ops[idx]["slot"])
+                                counts[engine] += 1
+                                scheduled.append(idx)
+
+                        for idx in ready_sorted:
+                            if idx in scheduled:
+                                continue
+                            eng = ops[idx]["engine"]
+                            if counts[eng] >= SLOT_LIMITS[eng]:
+                                continue
+                            bundle.setdefault(eng, []).append(ops[idx]["slot"])
+                            counts[eng] += 1
+                            scheduled.append(idx)
+
+                        if not scheduled:
+                            idx = max(ready, key=lambda i: (heights[i], -i))
+                            eng = ops[idx]["engine"]
+                            bundle.setdefault(eng, []).append(ops[idx]["slot"])
+                            scheduled.append(idx)
+
+                        scheduled_instrs.append(bundle)
+                        ready -= set(scheduled)
+                        for idx in scheduled:
+                            for v in succs[idx]:
+                                pred_count[v] -= 1
+                                if pred_count[v] == 0:
+                                    ready.add(v)
+                    return scheduled_instrs
+
+                return schedule_segment_slil()
+
             ready = [i for i, d in enumerate(deps) if d == 0]
             ready.sort()
             remaining = len(ops)
@@ -248,7 +323,7 @@ class KernelBuilder:
                     key=lambda i: (
                         -heights[i],
                         -engine_urgency[ops[i]["engine"]],
-                        i,
+                        tie_break[i],
                     )
                 )
                 for i in ready:
@@ -399,12 +474,21 @@ class KernelBuilder:
         partial_alu_xor_shift16_offsets = set(base_offsets[:0])
         partial_valu_parity_offsets = set(base_offsets[:0])
         partial_valu_adjust_offsets = set(base_offsets[:0])
+        depth2_use_flow = True
         base_consts = [self.scratch_const(i) for i in base_offsets]
+        group_blocks = 8
+        offset_groups = [
+            base_offsets[i : i + group_blocks]
+            for i in range(0, len(base_offsets), group_blocks)
+        ]
 
         idx_scratch = self.alloc_scratch("idx_scratch", batch_size)
         val_scratch = self.alloc_scratch("val_scratch", batch_size)
         tmp_scratch = self.alloc_scratch("tmp_scratch", batch_size)
-        shift_scratch = self.alloc_scratch("shift_scratch", batch_size)
+        if ALIAS_SHIFT_TMP:
+            shift_scratch = tmp_scratch
+        else:
+            shift_scratch = self.alloc_scratch("shift_scratch", batch_size)
 
         zero_vec = alloc_vec("zero_vec")
         one_vec = alloc_vec("one_vec")
@@ -556,57 +640,75 @@ class KernelBuilder:
 
         wrap_round = forest_height + 1
 
-        def emit_round_two_nodes(use_parity_cond: bool = False):
+        def emit_round_two_nodes(active_offsets, use_parity_cond: bool = False):
             if not use_parity_cond:
                 slots = []
-                for base_offset in base_offsets:
+                for base_offset in active_offsets:
                     idx_block = idx_scratch + base_offset
                     tmp_block = tmp_scratch + base_offset
                     slots.append(("==", tmp_block, idx_block, one_vec))
                 emit_valu(slots)
-                for base_offset in base_offsets:
+                for base_offset in active_offsets:
                     tmp_block = tmp_scratch + base_offset
                     emit(flow=[("vselect", tmp_block, tmp_block, node1_vec, node2_vec)])
             else:
-                for base_offset in base_offsets:
+                for base_offset in active_offsets:
                     tmp_block = tmp_scratch + base_offset
                     if c6_lsb:
                         emit(flow=[("vselect", tmp_block, tmp_block, node1_vec, node2_vec)])
                     else:
                         emit(flow=[("vselect", tmp_block, tmp_block, node2_vec, node1_vec)])
             slots = []
-            for base_offset in base_offsets:
+            for base_offset in active_offsets:
                 val_block = val_scratch + base_offset
                 tmp_block = tmp_scratch + base_offset
                 slots.append(("^", val_block, val_block, tmp_block))
             emit_valu(slots)
 
-        def emit_round_four_nodes():
+        def emit_round_four_nodes(active_offsets):
             slots = []
-            for base_offset in base_offsets:
+            for base_offset in active_offsets:
                 idx_block = idx_scratch + base_offset
                 b1_block = shift_scratch + base_offset
                 slots.append(("&", b1_block, idx_block, two_vec))
             emit_valu(slots)
-            for base_offset in base_offsets:
-                b1_block = shift_scratch + base_offset
-                b0_block = tmp_scratch + base_offset
-                emit(flow=[("vselect", sel2_t0_vec, b1_block, node6_vec, node4_vec)])
-                emit(flow=[("vselect", sel2_t1_vec, b1_block, node3_vec, node5_vec)])
-                if c6_lsb:
-                    emit(flow=[("vselect", b0_block, b0_block, sel2_t1_vec, sel2_t0_vec)])
-                else:
-                    emit(flow=[("vselect", b0_block, b0_block, sel2_t0_vec, sel2_t1_vec)])
+            if depth2_use_flow:
+                for base_offset in active_offsets:
+                    b1_block = shift_scratch + base_offset
+                    b0_block = tmp_scratch + base_offset
+                    emit(flow=[("vselect", sel2_t0_vec, b1_block, node6_vec, node4_vec)])
+                    emit(flow=[("vselect", sel2_t1_vec, b1_block, node3_vec, node5_vec)])
+                    if c6_lsb:
+                        emit(flow=[("vselect", b0_block, b0_block, sel2_t1_vec, sel2_t0_vec)])
+                    else:
+                        emit(flow=[("vselect", b0_block, b0_block, sel2_t0_vec, sel2_t1_vec)])
+            else:
+                for base_offset in active_offsets:
+                    b1_block = shift_scratch + base_offset
+                    b0_block = tmp_scratch + base_offset
+                    # Convert b1 (0 or 2) to 0/1 for arithmetic select.
+                    emit_valu([(">>", b1_block, b1_block, one_vec)])
+                    # sel2_t0 = select(b1, node6, node4)
+                    emit_valu([("-", sel2_t0_vec, node6_vec, node4_vec)])
+                    emit_valu([("multiply_add", sel2_t0_vec, sel2_t0_vec, b1_block, node4_vec)])
+                    # sel2_t1 = select(b1, node3, node5)
+                    emit_valu([("-", sel2_t1_vec, node3_vec, node5_vec)])
+                    emit_valu([("multiply_add", sel2_t1_vec, sel2_t1_vec, b1_block, node5_vec)])
+                    if c6_lsb:
+                        emit_valu([("-", b0_block, one_vec, b0_block)])
+                    # b0_block holds 0/1; select between sel2_t0 and sel2_t1
+                    emit_valu([("-", sel2_t0_vec, sel2_t0_vec, sel2_t1_vec)])
+                    emit_valu([("multiply_add", b0_block, sel2_t0_vec, b0_block, sel2_t1_vec)])
             slots = []
-            for base_offset in base_offsets:
+            for base_offset in active_offsets:
                 val_block = val_scratch + base_offset
                 sel_block = tmp_scratch + base_offset
                 slots.append(("^", val_block, val_block, sel_block))
             emit_valu(slots)
 
-        def emit_round_eight_nodes(sel_t0, sel_t1, sel_b0):
+        def emit_round_eight_nodes(active_offsets, sel_t0, sel_t1, sel_b0):
             # Bit-tree vselect for depth-3 nodes (7..14) using idx bitmasks.
-            for base_offset in base_offsets:
+            for base_offset in active_offsets:
                 idx_block = idx_scratch + base_offset
                 tmp_block = tmp_scratch + base_offset
                 mask_block = shift_scratch + base_offset
@@ -643,7 +745,7 @@ class KernelBuilder:
                     skip_last_addr = True
                     final_addr = False
 
-        for round_idx in range(rounds):
+        def emit_round(round_idx, active_offsets):
             use_addr = False
             phase = None
             if round_idx >= 4 and wrap_round > 4:
@@ -655,36 +757,36 @@ class KernelBuilder:
 
             if use_addr and phase == 0:
                 slots = []
-                for base_offset in base_offsets:
+                for base_offset in active_offsets:
                     idx_block = idx_scratch + base_offset
                     slots.append(("+", idx_block, idx_block, forest_values_vec))
                 emit_valu(slots)
 
             if round_idx == 0 or round_idx == wrap_round:
                 slots = []
-                for base_offset in base_offsets:
+                for base_offset in active_offsets:
                     val_block = val_scratch + base_offset
                     slots.append(("^", val_block, val_block, node0_vec))
                 emit_valu(slots)
             elif round_idx == 1 or round_idx == wrap_round + 1:
-                emit_round_two_nodes(use_parity_cond=True)
+                emit_round_two_nodes(active_offsets, use_parity_cond=True)
             elif round_idx == 2 or round_idx == wrap_round + 2:
-                emit_round_four_nodes()
+                emit_round_four_nodes(active_offsets)
             elif round_idx == 3:
-                emit_round_eight_nodes(sel_t0_vec, sel_t1_vec, sel_b0_vec)
+                emit_round_eight_nodes(active_offsets, sel_t0_vec, sel_t1_vec, sel_b0_vec)
             elif round_idx == wrap_round + 3:
-                emit_round_eight_nodes(sel_t0_vec2, sel_t1_vec2, sel_b0_vec2)
+                emit_round_eight_nodes(active_offsets, sel_t0_vec2, sel_t1_vec2, sel_b0_vec2)
             else:
                 slots = []
                 if not use_addr:
-                    for base_offset in base_offsets:
+                    for base_offset in active_offsets:
                         idx_block = idx_scratch + base_offset
                         tmp_block = tmp_scratch + base_offset
                         slots.append(("+", tmp_block, idx_block, forest_values_vec))
                     emit_valu(slots)
 
                 load_slots = []
-                for base_offset in base_offsets:
+                for base_offset in active_offsets:
                     addr_block = (
                         idx_scratch + base_offset
                         if use_addr
@@ -692,33 +794,33 @@ class KernelBuilder:
                     )
                     tmp_block = tmp_scratch + base_offset
                     for offset in range(VLEN):
-                        load_slots.append(
-                            ("load_offset", tmp_block, addr_block, offset)
-                        )
+                        load_slots.append((
+                            "load_offset", tmp_block, addr_block, offset
+                        ))
                 emit_load(load_slots)
 
                 slots = []
-                for base_offset in base_offsets:
+                for base_offset in active_offsets:
                     tmp_block = tmp_scratch + base_offset
                     slots.append(("^", tmp_block, tmp_block, c6_vec))
                 emit_valu(slots)
 
                 slots = []
-                for base_offset in base_offsets:
+                for base_offset in active_offsets:
                     val_block = val_scratch + base_offset
                     tmp_block = tmp_scratch + base_offset
                     slots.append(("^", val_block, val_block, tmp_block))
                 emit_valu(slots)
 
             slots = []
-            for base_offset in base_offsets:
+            for base_offset in active_offsets:
                 val_block = val_scratch + base_offset
                 slots.append(("multiply_add", val_block, val_block, mul12_vec, c1_vec))
             emit_valu(slots)
 
             valu_slots = []
             alu_slots = []
-            for base_offset in base_offsets:
+            for base_offset in active_offsets:
                 val_block = val_scratch + base_offset
                 tmp_block = shift_scratch + base_offset
                 if base_offset in partial_valu_shift19_offsets:
@@ -736,7 +838,7 @@ class KernelBuilder:
             use_partial_alu_xor = round_idx == rounds - 1
             valu_slots = []
             alu_slots = []
-            for base_offset in base_offsets:
+            for base_offset in active_offsets:
                 val_block = val_scratch + base_offset
                 tmp_block = shift_scratch + base_offset
                 if use_partial_alu_xor and base_offset in partial_alu_xor_tmp_offsets:
@@ -752,7 +854,7 @@ class KernelBuilder:
 
             valu_slots = []
             alu_slots = []
-            for base_offset in base_offsets:
+            for base_offset in active_offsets:
                 val_block = val_scratch + base_offset
                 if use_partial_alu_xor and base_offset in partial_alu_xor_offsets:
                     for lane in range(VLEN):
@@ -766,7 +868,7 @@ class KernelBuilder:
             emit_valu(valu_slots)
 
             slots = []
-            for base_offset in base_offsets:
+            for base_offset in active_offsets:
                 val_block = val_scratch + base_offset
                 slots.append(("multiply_add", val_block, val_block, mul5_vec, c3_vec))
             emit_valu(slots)
@@ -777,7 +879,7 @@ class KernelBuilder:
             if use_alu_shift16:
                 valu_slots = []
                 alu_slots = []
-                for base_offset in base_offsets:
+                for base_offset in active_offsets:
                     val_block = val_scratch + base_offset
                     tmp_block = shift_scratch + base_offset
                     if base_offset in partial_valu_shift9_offsets:
@@ -795,7 +897,7 @@ class KernelBuilder:
                 use_partial_alu_shift = round_idx == rounds - 1
                 valu_slots = []
                 alu_slots = []
-                for base_offset in base_offsets:
+                for base_offset in active_offsets:
                     val_block = val_scratch + base_offset
                     tmp_block = shift_scratch + base_offset
                     if use_partial_alu_shift and base_offset in partial_alu_shift9_offsets:
@@ -812,7 +914,7 @@ class KernelBuilder:
             use_partial_alu_add = round_idx == rounds - 1
             valu_slots = []
             alu_slots = []
-            for base_offset in base_offsets:
+            for base_offset in active_offsets:
                 val_block = val_scratch + base_offset
                 if use_partial_alu_add and base_offset in partial_alu_add_c4_offsets:
                     for lane in range(VLEN):
@@ -826,7 +928,7 @@ class KernelBuilder:
 
             valu_slots = []
             alu_slots = []
-            for base_offset in base_offsets:
+            for base_offset in active_offsets:
                 val_block = val_scratch + base_offset
                 tmp_block = shift_scratch + base_offset
                 if use_partial_alu_xor and base_offset in partial_alu_xor_shift9_offsets:
@@ -841,7 +943,7 @@ class KernelBuilder:
             emit_valu(valu_slots)
 
             slots = []
-            for base_offset in base_offsets:
+            for base_offset in active_offsets:
                 val_block = val_scratch + base_offset
                 slots.append(("multiply_add", val_block, val_block, mul3_vec, c5_vec))
             emit_valu(slots)
@@ -849,7 +951,7 @@ class KernelBuilder:
             if use_alu_shift:
                 valu_slots = []
                 alu_slots = []
-                for base_offset in base_offsets:
+                for base_offset in active_offsets:
                     val_block = val_scratch + base_offset
                     tmp_block = shift_scratch + base_offset
                     if base_offset in partial_valu_shift16_offsets:
@@ -867,7 +969,7 @@ class KernelBuilder:
                 use_partial_alu_shift = round_idx == rounds - 1
                 valu_slots = []
                 alu_slots = []
-                for base_offset in base_offsets:
+                for base_offset in active_offsets:
                     val_block = val_scratch + base_offset
                     tmp_block = shift_scratch + base_offset
                     if use_partial_alu_shift and base_offset in partial_alu_shift16_offsets:
@@ -883,7 +985,7 @@ class KernelBuilder:
 
             valu_slots = []
             alu_slots = []
-            for base_offset in base_offsets:
+            for base_offset in active_offsets:
                 val_block = val_scratch + base_offset
                 tmp_block = shift_scratch + base_offset
                 if use_partial_alu_xor and base_offset in partial_alu_xor_shift16_offsets:
@@ -899,7 +1001,7 @@ class KernelBuilder:
 
             if round_idx % wrap_round == wrap_round - 1:
                 slots = []
-                for base_offset in base_offsets:
+                for base_offset in active_offsets:
                     idx_block = idx_scratch + base_offset
                     slots.append(("+", idx_block, zero_vec, zero_vec))
                 emit_valu(slots)
@@ -907,7 +1009,7 @@ class KernelBuilder:
                 # Parity AND: mostly ALU, optionally VALU for selected blocks
                 valu_slots = []
                 alu_slots = []
-                for base_offset in base_offsets:
+                for base_offset in active_offsets:
                     val_block = val_scratch + base_offset
                     tmp_block = tmp_scratch + base_offset
                     if base_offset in partial_valu_parity_offsets:
@@ -922,80 +1024,115 @@ class KernelBuilder:
                 if valu_slots:
                     emit_valu(valu_slots)
 
-                slots = []
-                for base_offset in base_offsets:
-                    idx_block = idx_scratch + base_offset
-                    if c6_lsb:
-                        if use_addr:
-                            slots.append(
-                                ("multiply_add", idx_block, idx_block, two_vec, two_minus_base_vec)
-                            )
-                        else:
-                            slots.append(
-                                ("multiply_add", idx_block, idx_block, two_vec, two_vec)
-                            )
-                    else:
-                        if use_addr:
-                            slots.append(
-                                ("multiply_add", idx_block, idx_block, two_vec, one_minus_base_vec)
-                            )
-                        else:
-                            slots.append(
-                                ("multiply_add", idx_block, idx_block, two_vec, one_vec)
-                            )
-                emit_valu(slots)
-
-                if round_idx == rounds - 1:
+                if FOLD_IDX_ADJUST:
+                    # Compute (base +/- parity) into shift_scratch, keeping tmp_scratch for next-round selects.
                     slots = []
-                    for base_offset in base_offsets:
-                        idx_block = idx_scratch + base_offset
+                    for base_offset in active_offsets:
                         tmp_block = tmp_scratch + base_offset
+                        add_block = shift_scratch + base_offset
                         if c6_lsb:
-                            slots.append(("-", idx_block, idx_block, tmp_block))
+                            if use_addr:
+                                slots.append(("-", add_block, two_minus_base_vec, tmp_block))
+                            else:
+                                slots.append(("-", add_block, two_vec, tmp_block))
                         else:
-                            slots.append(("+", idx_block, idx_block, tmp_block))
+                            if use_addr:
+                                slots.append(("+", add_block, tmp_block, one_minus_base_vec))
+                            else:
+                                slots.append(("+", add_block, tmp_block, one_vec))
+                    emit_valu(slots)
+
+                    slots = []
+                    for base_offset in active_offsets:
+                        idx_block = idx_scratch + base_offset
+                        add_block = shift_scratch + base_offset
+                        slots.append(("multiply_add", idx_block, idx_block, two_vec, add_block))
                     emit_valu(slots)
                 else:
-                    # Always use ALU for parity adjustment to reduce VALU pressure
-                    alu_slots = []
-                    valu_slots = []
-                    if c6_lsb:
-                        for base_offset in base_offsets:
-                            idx_block = idx_scratch + base_offset
-                            tmp_block = tmp_scratch + base_offset
-                            if base_offset in partial_valu_adjust_offsets:
-                                valu_slots.append(("-", idx_block, idx_block, tmp_block))
+                    slots = []
+                    for base_offset in active_offsets:
+                        idx_block = idx_scratch + base_offset
+                        if c6_lsb:
+                            if use_addr:
+                                slots.append(
+                                    ("multiply_add", idx_block, idx_block, two_vec, two_minus_base_vec)
+                                )
                             else:
-                                for lane in range(VLEN):
-                                    alu_slots.append(
-                                        (
-                                            "-",
-                                            idx_block + lane,
-                                            idx_block + lane,
-                                            tmp_block + lane,
-                                        )
-                                    )
-                    else:
-                        for base_offset in base_offsets:
-                            idx_block = idx_scratch + base_offset
-                            tmp_block = tmp_scratch + base_offset
-                            if base_offset in partial_valu_adjust_offsets:
-                                valu_slots.append(("+", idx_block, idx_block, tmp_block))
+                                slots.append(
+                                    ("multiply_add", idx_block, idx_block, two_vec, two_vec)
+                                )
+                        else:
+                            if use_addr:
+                                slots.append(
+                                    ("multiply_add", idx_block, idx_block, two_vec, one_minus_base_vec)
+                                )
                             else:
-                                for lane in range(VLEN):
-                                    alu_slots.append(
-                                        (
-                                            "+",
-                                            idx_block + lane,
-                                            idx_block + lane,
-                                            tmp_block + lane,
-                                        )
-                                    )
-                    if alu_slots:
-                        emit_alu(alu_slots)
-                    if valu_slots:
-                        emit_valu(valu_slots)
+                                slots.append(
+                                    ("multiply_add", idx_block, idx_block, two_vec, one_vec)
+                                )
+                    emit_valu(slots)
 
+                    if round_idx == rounds - 1:
+                        slots = []
+                        for base_offset in active_offsets:
+                            idx_block = idx_scratch + base_offset
+                            tmp_block = tmp_scratch + base_offset
+                            if c6_lsb:
+                                slots.append(("-", idx_block, idx_block, tmp_block))
+                            else:
+                                slots.append(("+", idx_block, idx_block, tmp_block))
+                        emit_valu(slots)
+                    else:
+                        # Always use ALU for parity adjustment to reduce VALU pressure
+                        alu_slots = []
+                        valu_slots = []
+                        if c6_lsb:
+                            for base_offset in active_offsets:
+                                idx_block = idx_scratch + base_offset
+                                tmp_block = tmp_scratch + base_offset
+                                if base_offset in partial_valu_adjust_offsets:
+                                    valu_slots.append(("-", idx_block, idx_block, tmp_block))
+                                else:
+                                    for lane in range(VLEN):
+                                        alu_slots.append(
+                                            (
+                                                "-",
+                                                idx_block + lane,
+                                                idx_block + lane,
+                                                tmp_block + lane,
+                                            )
+                                        )
+                        else:
+                            for base_offset in active_offsets:
+                                idx_block = idx_scratch + base_offset
+                                tmp_block = tmp_scratch + base_offset
+                                if base_offset in partial_valu_adjust_offsets:
+                                    valu_slots.append(("+", idx_block, idx_block, tmp_block))
+                                else:
+                                    for lane in range(VLEN):
+                                        alu_slots.append(
+                                            (
+                                                "+",
+                                                idx_block + lane,
+                                                idx_block + lane,
+                                                tmp_block + lane,
+                                            )
+                                        )
+                        if alu_slots:
+                            emit_alu(alu_slots)
+                        if valu_slots:
+                            emit_valu(valu_slots)
+
+        if USE_WAVEFRONT:
+            for wave_idx in range(rounds + len(offset_groups) - 1):
+                for group_idx, group_offsets in enumerate(offset_groups):
+                    round_idx = wave_idx - group_idx
+                    if round_idx < 0 or round_idx >= rounds:
+                        continue
+                    emit_round(round_idx, group_offsets)
+        else:
+            for round_idx in range(rounds):
+                emit_round(round_idx, base_offsets)
         if final_addr:
             slots = []
             for base_offset in base_offsets:
@@ -1023,6 +1160,11 @@ class KernelBuilder:
         self.instrs = self._pack_vliw(self.instrs)
 
 BASELINE = 147734
+SCHED_SEED = None
+USE_SLIL_SCHED = False
+FOLD_IDX_ADJUST = False
+ALIAS_SHIFT_TMP = False
+USE_WAVEFRONT = True
 
 def do_kernel_test(
     forest_height: int,
