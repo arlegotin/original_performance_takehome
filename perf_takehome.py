@@ -387,13 +387,16 @@ class KernelBuilder:
         self.add("alu", ("+", two_minus_base, one_minus_base, one_const))
 
         base_offsets = list(range(0, batch_size, VLEN))
-        partial_alu_shift9_offsets = set(base_offsets[:16])
-        partial_alu_shift16_offsets = set(base_offsets[:16])
+        partial_alu_shift9_offsets = set(base_offsets[:15])
+        partial_alu_shift16_offsets = set(base_offsets[:15])
         partial_alu_xor_offsets = set(base_offsets[:0])
-        partial_valu_shift19_offsets = set(base_offsets[i] for i in (1, 3))
+        partial_valu_shift19_offsets = set(base_offsets[i] for i in (4,))
         partial_valu_shift9_offsets = set(base_offsets[:0])
         partial_valu_shift16_offsets = set(base_offsets[:0])
+        partial_alu_add_c4_offsets = set(base_offsets[:0])
         partial_alu_xor_tmp_offsets = set(base_offsets[:0])
+        partial_alu_xor_shift9_offsets = set(base_offsets[:0])
+        partial_alu_xor_shift16_offsets = set(base_offsets[:0])
         partial_valu_parity_offsets = set(base_offsets[:0])
         partial_valu_adjust_offsets = set(base_offsets[:0])
         base_consts = [self.scratch_const(i) for i in base_offsets]
@@ -730,12 +733,13 @@ class KernelBuilder:
             if valu_slots:
                 emit_valu(valu_slots)
 
+            use_partial_alu_xor = round_idx == rounds - 1
             valu_slots = []
             alu_slots = []
             for base_offset in base_offsets:
                 val_block = val_scratch + base_offset
                 tmp_block = shift_scratch + base_offset
-                if base_offset in partial_alu_xor_tmp_offsets:
+                if use_partial_alu_xor and base_offset in partial_alu_xor_tmp_offsets:
                     for lane in range(VLEN):
                         alu_slots.append(
                             ("^", val_block + lane, val_block + lane, tmp_block + lane)
@@ -750,7 +754,7 @@ class KernelBuilder:
             alu_slots = []
             for base_offset in base_offsets:
                 val_block = val_scratch + base_offset
-                if base_offset in partial_alu_xor_offsets:
+                if use_partial_alu_xor and base_offset in partial_alu_xor_offsets:
                     for lane in range(VLEN):
                         alu_slots.append(
                             ("^", val_block + lane, val_block + lane, c2_const)
@@ -805,18 +809,36 @@ class KernelBuilder:
                     emit_alu(alu_slots)
                 emit_valu(valu_slots)
 
-            slots = []
+            use_partial_alu_add = round_idx == rounds - 1
+            valu_slots = []
+            alu_slots = []
             for base_offset in base_offsets:
                 val_block = val_scratch + base_offset
-                slots.append(("+", val_block, val_block, c4_vec))
-            emit_valu(slots)
+                if use_partial_alu_add and base_offset in partial_alu_add_c4_offsets:
+                    for lane in range(VLEN):
+                        alu_slots.append(("+", val_block + lane, val_block + lane, c4_const))
+                else:
+                    valu_slots.append(("+", val_block, val_block, c4_vec))
+            if alu_slots:
+                emit_alu(alu_slots)
+            if valu_slots:
+                emit_valu(valu_slots)
 
-            slots = []
+            valu_slots = []
+            alu_slots = []
             for base_offset in base_offsets:
                 val_block = val_scratch + base_offset
                 tmp_block = shift_scratch + base_offset
-                slots.append(("^", val_block, val_block, tmp_block))
-            emit_valu(slots)
+                if use_partial_alu_xor and base_offset in partial_alu_xor_shift9_offsets:
+                    for lane in range(VLEN):
+                        alu_slots.append(
+                            ("^", val_block + lane, val_block + lane, tmp_block + lane)
+                        )
+                else:
+                    valu_slots.append(("^", val_block, val_block, tmp_block))
+            if alu_slots:
+                emit_alu(alu_slots)
+            emit_valu(valu_slots)
 
             slots = []
             for base_offset in base_offsets:
@@ -859,12 +881,21 @@ class KernelBuilder:
                     emit_alu(alu_slots)
                 emit_valu(valu_slots)
 
-            slots = []
+            valu_slots = []
+            alu_slots = []
             for base_offset in base_offsets:
                 val_block = val_scratch + base_offset
                 tmp_block = shift_scratch + base_offset
-                slots.append(("^", val_block, val_block, tmp_block))
-            emit_valu(slots)
+                if use_partial_alu_xor and base_offset in partial_alu_xor_shift16_offsets:
+                    for lane in range(VLEN):
+                        alu_slots.append(
+                            ("^", val_block + lane, val_block + lane, tmp_block + lane)
+                        )
+                else:
+                    valu_slots.append(("^", val_block, val_block, tmp_block))
+            if alu_slots:
+                emit_alu(alu_slots)
+            emit_valu(valu_slots)
 
             if round_idx % wrap_round == wrap_round - 1:
                 slots = []
