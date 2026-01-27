@@ -387,7 +387,9 @@ class KernelBuilder:
         self.add("alu", ("+", two_minus_base, one_minus_base, one_const))
 
         base_offsets = list(range(0, batch_size, VLEN))
-        partial_alu_shift_offsets = set(base_offsets[:4])
+        partial_alu_shift_offsets = set(base_offsets[:12])
+        partial_alu_xor_offsets = set(base_offsets[:0])
+        partial_valu_shift19_offsets = set(base_offsets[:2])
         base_consts = [self.scratch_const(i) for i in base_offsets]
 
         idx_scratch = self.alloc_scratch("idx_scratch", batch_size)
@@ -405,6 +407,7 @@ class KernelBuilder:
 
         shift9_vec = alloc_vec("shift9_vec")
         shift16_vec = alloc_vec("shift16_vec")
+        shift19_vec = alloc_vec("shift19_vec") if partial_valu_shift19_offsets else None
         mul12_vec = alloc_vec("mul12_vec")
         mul5_vec = alloc_vec("mul5_vec")
         mul3_vec = alloc_vec("mul3_vec")
@@ -474,6 +477,8 @@ class KernelBuilder:
             ("vbroadcast", node13_vec, node13_const),
             ("vbroadcast", node14_vec, node14_const),
         ]
+        if shift19_vec is not None:
+            vbroadcast_slots.append(("vbroadcast", shift19_vec, shift19_const))
         for i in range(0, len(vbroadcast_slots), SLOT_LIMITS["valu"]):
             emit(valu=vbroadcast_slots[i : i + SLOT_LIMITS["valu"]])
 
@@ -702,15 +707,22 @@ class KernelBuilder:
                 slots.append(("multiply_add", val_block, val_block, mul12_vec, c1_vec))
             emit_valu(slots)
 
-            slots = []
+            valu_slots = []
+            alu_slots = []
             for base_offset in base_offsets:
                 val_block = val_scratch + base_offset
                 tmp_block = shift_scratch + base_offset
-                for lane in range(VLEN):
-                    slots.append(
-                        (">>", tmp_block + lane, val_block + lane, shift19_const)
-                    )
-            emit_alu(slots)
+                if base_offset in partial_valu_shift19_offsets:
+                    valu_slots.append((">>", tmp_block, val_block, shift19_vec))
+                else:
+                    for lane in range(VLEN):
+                        alu_slots.append(
+                            (">>", tmp_block + lane, val_block + lane, shift19_const)
+                        )
+            if alu_slots:
+                emit_alu(alu_slots)
+            if valu_slots:
+                emit_valu(valu_slots)
 
             slots = []
             for base_offset in base_offsets:
@@ -719,11 +731,20 @@ class KernelBuilder:
                 slots.append(("^", val_block, val_block, tmp_block))
             emit_valu(slots)
 
-            slots = []
+            valu_slots = []
+            alu_slots = []
             for base_offset in base_offsets:
                 val_block = val_scratch + base_offset
-                slots.append(("^", val_block, val_block, c2_vec))
-            emit_valu(slots)
+                if base_offset in partial_alu_xor_offsets:
+                    for lane in range(VLEN):
+                        alu_slots.append(
+                            ("^", val_block + lane, val_block + lane, c2_const)
+                        )
+                else:
+                    valu_slots.append(("^", val_block, val_block, c2_vec))
+            if alu_slots:
+                emit_alu(alu_slots)
+            emit_valu(valu_slots)
 
             slots = []
             for base_offset in base_offsets:
