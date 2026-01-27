@@ -319,6 +319,10 @@ class KernelBuilder:
                     eng: remaining_by_engine[eng] / SLOT_LIMITS[eng]
                     for eng in remaining_by_engine
                 }
+                if ENGINE_BIAS:
+                    for eng, bias in ENGINE_BIAS.items():
+                        if eng in engine_urgency:
+                            engine_urgency[eng] *= bias
                 ready.sort(
                     key=lambda i: (
                         -heights[i],
@@ -461,26 +465,36 @@ class KernelBuilder:
         two_minus_base = self.alloc_scratch("two_minus_base")
         self.add("alu", ("+", two_minus_base, one_minus_base, one_const))
 
-        base_offsets = list(range(0, batch_size, VLEN))
-        partial_alu_shift9_offsets = set(base_offsets[:15])
-        partial_alu_shift16_offsets = set(base_offsets[:15])
-        partial_alu_xor_offsets = set(base_offsets[:0])
-        partial_valu_shift19_offsets = set(base_offsets[i] for i in (4,))
-        partial_valu_shift9_offsets = set(base_offsets[:0])
-        partial_valu_shift16_offsets = set(base_offsets[:0])
-        partial_alu_add_c4_offsets = set(base_offsets[:0])
-        partial_alu_xor_tmp_offsets = set(base_offsets[:0])
-        partial_alu_xor_shift9_offsets = set(base_offsets[:0])
-        partial_alu_xor_shift16_offsets = set(base_offsets[:0])
-        partial_valu_parity_offsets = set(base_offsets[:0])
-        partial_valu_adjust_offsets = set(base_offsets[:0])
+        natural_offsets = list(range(0, batch_size, VLEN))
+        base_offsets = list(natural_offsets)
+        partial_alu_shift9_offsets = set(natural_offsets[:ALU_SHIFT9_K])
+        partial_alu_shift16_offsets = set(natural_offsets[:ALU_SHIFT16_K])
+        partial_alu_xor_offsets = set(natural_offsets[:ALU_XOR_C2_K])
+        if SHIFT19_PREFIX_K is None:
+            partial_valu_shift19_offsets = set(
+                natural_offsets[i] for i in SHIFT19_INDICES
+            )
+        else:
+            partial_valu_shift19_offsets = set(natural_offsets[:SHIFT19_PREFIX_K])
+        partial_valu_shift9_offsets = set(natural_offsets[:VALU_SHIFT9_K])
+        partial_valu_shift16_offsets = set(natural_offsets[:VALU_SHIFT16_K])
+        partial_alu_add_c4_offsets = set(natural_offsets[:ALU_ADD_K])
+        partial_alu_xor_tmp_offsets = set(natural_offsets[:ALU_XOR_TMP_K])
+        partial_alu_xor_shift9_offsets = set(natural_offsets[:ALU_XOR_SHIFT9_K])
+        partial_alu_xor_shift16_offsets = set(natural_offsets[:ALU_XOR_SHIFT16_K])
+        partial_valu_parity_offsets = set(natural_offsets[:VALU_PARITY_K])
+        partial_valu_adjust_offsets = set(natural_offsets[:VALU_ADJUST_K])
         depth2_use_flow = True
         base_consts = [self.scratch_const(i) for i in base_offsets]
-        group_blocks = 8
+        group_blocks = GROUP_BLOCKS
         offset_groups = [
             base_offsets[i : i + group_blocks]
             for i in range(0, len(base_offsets), group_blocks)
         ]
+        if GROUP_ORDER == "reverse":
+            offset_groups = list(reversed(offset_groups))
+        elif GROUP_ORDER == "evenodd":
+            offset_groups = offset_groups[::2] + offset_groups[1::2]
 
         idx_scratch = self.alloc_scratch("idx_scratch", batch_size)
         val_scratch = self.alloc_scratch("val_scratch", batch_size)
@@ -532,6 +546,9 @@ class KernelBuilder:
         sel_b0_vec2 = alloc_vec("sel_b0_vec2")
         sel_t0_vec2 = alloc_vec("sel_t0_vec2")
         sel_t1_vec2 = alloc_vec("sel_t1_vec2")
+        sel_b0_vec_alt = alloc_vec("sel_b0_vec_alt") if USE_SEL_ALT else None
+        sel_t0_vec_alt = alloc_vec("sel_t0_vec_alt") if USE_SEL_ALT else None
+        sel_t1_vec_alt = alloc_vec("sel_t1_vec_alt") if USE_SEL_ALT else None
         sel2_t0_vec = alloc_vec("sel2_t0_vec")
         sel2_t1_vec = alloc_vec("sel2_t1_vec")
 
@@ -706,9 +723,25 @@ class KernelBuilder:
                 slots.append(("^", val_block, val_block, sel_block))
             emit_valu(slots)
 
-        def emit_round_eight_nodes(active_offsets, sel_t0, sel_t1, sel_b0):
+        def emit_round_eight_nodes(
+            active_offsets,
+            sel_t0,
+            sel_t1,
+            sel_b0,
+            sel_t0_alt=None,
+            sel_t1_alt=None,
+            sel_b0_alt=None,
+        ):
             # Bit-tree vselect for depth-3 nodes (7..14) using idx bitmasks.
             for base_offset in active_offsets:
+                if sel_t0_alt is not None and (base_offset // VLEN) & 1:
+                    sel0 = sel_t0_alt
+                    sel1 = sel_t1_alt
+                    selb = sel_b0_alt
+                else:
+                    sel0 = sel_t0
+                    sel1 = sel_t1
+                    selb = sel_b0
                 idx_block = idx_scratch + base_offset
                 tmp_block = tmp_scratch + base_offset
                 mask_block = shift_scratch + base_offset
@@ -716,21 +749,21 @@ class KernelBuilder:
                 emit_valu([("&", mask_block, idx_block, two_vec)])
                 emit(
                     flow=[
-                        ("vselect", sel_t0, tmp_block, node9_vec, node8_vec),
-                        ("vselect", sel_t1, tmp_block, node11_vec, node10_vec),
+                        ("vselect", sel0, tmp_block, node9_vec, node8_vec),
+                        ("vselect", sel1, tmp_block, node11_vec, node10_vec),
                     ]
                 )
-                emit(flow=[("vselect", sel_t0, mask_block, sel_t1, sel_t0)])
+                emit(flow=[("vselect", sel0, mask_block, sel1, sel0)])
                 emit(
                     flow=[
-                        ("vselect", sel_t1, tmp_block, node13_vec, node12_vec),
-                        ("vselect", sel_b0, tmp_block, node7_vec, node14_vec),
+                        ("vselect", sel1, tmp_block, node13_vec, node12_vec),
+                        ("vselect", selb, tmp_block, node7_vec, node14_vec),
                     ]
                 )
-                emit(flow=[("vselect", sel_t1, mask_block, sel_b0, sel_t1)])
+                emit(flow=[("vselect", sel1, mask_block, selb, sel1)])
                 emit_valu([("&", mask_block, idx_block, four_vec)])
-                emit(flow=[("vselect", sel_t0, mask_block, sel_t1, sel_t0)])
-                emit_valu([("^", val_block, val_block, sel_t0)])
+                emit(flow=[("vselect", sel0, mask_block, sel1, sel0)])
+                emit_valu([("^", val_block, val_block, sel0)])
 
         final_addr = False
         skip_last_addr = False
@@ -773,7 +806,15 @@ class KernelBuilder:
             elif round_idx == 2 or round_idx == wrap_round + 2:
                 emit_round_four_nodes(active_offsets)
             elif round_idx == 3:
-                emit_round_eight_nodes(active_offsets, sel_t0_vec, sel_t1_vec, sel_b0_vec)
+                emit_round_eight_nodes(
+                    active_offsets,
+                    sel_t0_vec,
+                    sel_t1_vec,
+                    sel_b0_vec,
+                    sel_t0_vec_alt,
+                    sel_t1_vec_alt,
+                    sel_b0_vec_alt,
+                )
             elif round_idx == wrap_round + 3:
                 emit_round_eight_nodes(active_offsets, sel_t0_vec2, sel_t1_vec2, sel_b0_vec2)
             else:
@@ -911,7 +952,7 @@ class KernelBuilder:
                     emit_alu(alu_slots)
                 emit_valu(valu_slots)
 
-            use_partial_alu_add = round_idx == rounds - 1
+            use_partial_alu_add = ALU_ADD_ALL_ROUNDS or round_idx == rounds - 1
             valu_slots = []
             alu_slots = []
             for base_offset in active_offsets:
@@ -1165,6 +1206,24 @@ USE_SLIL_SCHED = False
 FOLD_IDX_ADJUST = False
 ALIAS_SHIFT_TMP = False
 USE_WAVEFRONT = True
+GROUP_ORDER = "natural"
+GROUP_BLOCKS = 3
+ENGINE_BIAS = None
+USE_SEL_ALT = False
+ALU_SHIFT9_K = 15
+ALU_SHIFT16_K = 16
+ALU_ADD_K = 0
+ALU_ADD_ALL_ROUNDS = False
+ALU_XOR_TMP_K = 0
+ALU_XOR_C2_K = 0
+ALU_XOR_SHIFT9_K = 0
+ALU_XOR_SHIFT16_K = 0
+VALU_SHIFT9_K = 0
+VALU_SHIFT16_K = 0
+VALU_PARITY_K = 0
+VALU_ADJUST_K = 0
+SHIFT19_PREFIX_K = None
+SHIFT19_INDICES = (4,)
 
 def do_kernel_test(
     forest_height: int,
