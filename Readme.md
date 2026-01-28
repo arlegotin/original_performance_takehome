@@ -1,38 +1,15 @@
-# The current result is 1136 cycles
+# The current result is 1133 cycles
 
 ## 🔴 Live updates
-- **1136** (27 Jan, 23:59 CET)
-- **1137** (27 Jan, 23:30 CET)
-- **1138** (27 Jan, 22:39 CET)
-- **1139** (27 Jan, 21:53 CET)
-- **1145** (27 Jan, 21:09 CET)
-- **1149** (27 Jan, 20:52 CET)
-- **1156** (25 Jan, 17:59 CET)
-- **1160** (25 Jan, 17:07 CET)
-- **1165** (25 Jan, 15:53 CET)
-- **1171** (24 Jan, 21:05 CET)
-- **1172** (24 Jan, 19:07 CET)
-- **1174** (24 Jan, 17:45 CET)
-- **1180** (24 Jan, 16:58 CET)
-- **1182** (22 Jan, 23:24 CET)
-- **1183** (22 Jan, 22:39 CET)
-- **1188** (22 Jan, 18:40 CET)
-- **1199** (22 Jan, 18:08 CET)
-- **1205** (22 Jan, 16:59 CET)
-- **1223** (22 Jan, 16:38 CET)
-- **1236** (22 Jan, 14:36 CET)
-- **1260** (22 Jan, 14:24 CET)
-- **1264** (22 Jan, 12:15 CET)
-- **1273** (22 Jan, 11:57 CET)
-- **1309** (22 Jan, 11:45 CET)
-- **1364** (22 Jan, 11:27 CET)
-- **1453** (22 Jan, 11:06 CET)
-- **1457** (21 Jan, 21:57 CET)
-- **1465** (21 Jan, 21:47 CET)
-- **1468** (21 Jan, 20:55 CET)
-- **1470** (21 Jan, 20:30 CET)
-- **1472** (21 Jan, 20:01 CET)
-- **1474** (21 Jan, 19:20 CET)
+- 1133 (29 Jan, 00:27 CET)
+- 1171 (24 Jan, 21:05 CET)
+- 1205 (22 Jan, 16:59 CET)
+- 1236 (22 Jan, 14:36 CET)
+- 1273 (22 Jan, 11:57 CET)
+- 1309 (22 Jan, 11:45 CET) <-- 🥳 beat Claude Opus 4.5 with test-time harness
+- 1364 (22 Jan, 11:27 CET)
+- 1474 (21 Jan, 19:20 CET) <-- 🥳 beat Claude Opus 4.5
+
 
 # Anthropic's Original Performance Take-Home
 
